@@ -119,8 +119,14 @@ struct WorkbenchSidebarView: View {
         HStack {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.secondary)
-            TextField("Search sessions", text: $model.searchText)
+            TextField("Search sessions  ·  ⏎ opens best match", text: $model.searchText)
                 .textFieldStyle(.plain)
+                .onSubmit {
+                    if let top = model.topSearchMatch {
+                        model.select(top)
+                        onOpenSession(top)
+                    }
+                }
         }
         .padding(7)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .textBackgroundColor)))

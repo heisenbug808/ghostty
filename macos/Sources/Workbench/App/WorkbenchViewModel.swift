@@ -125,11 +125,19 @@ final class WorkbenchViewModel: ObservableObject {
     var filteredSessions: [WorkbenchSessionRecord] {
         let base = sessions.filter { filter.matches($0) }
         guard !searchText.isEmpty else { return base }
-        return base.filter { session in
-            session.displayTitle.localizedCaseInsensitiveContains(searchText) ||
-            session.id.localizedCaseInsensitiveContains(searchText) ||
-            (session.cwd?.localizedCaseInsensitiveContains(searchText) ?? false)
-        }
+        return base.filter { WorkbenchFuzzy.score(query: searchText, session: $0) != nil }
+    }
+
+    /// Highest-scoring match for the current search — what Enter in the search
+    /// field opens (fuzzy quick-open, the core "command palette" value).
+    var topSearchMatch: WorkbenchSessionRecord? {
+        guard !searchText.isEmpty else { return nil }
+        return sessions
+            .filter { filter.matches($0) }
+            .compactMap { session in
+                WorkbenchFuzzy.score(query: searchText, session: session).map { (session, $0) }
+            }
+            .max { $0.1 < $1.1 }?.0
     }
 
     var selectedSession: WorkbenchSessionRecord? {

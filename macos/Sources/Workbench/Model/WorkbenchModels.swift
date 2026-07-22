@@ -26,6 +26,37 @@ struct WorkbenchProjectRecord: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
+/// Subsequence fuzzy matcher for the sidebar's quick-open search — so typing
+/// "pmrsf" finds "partner-prm-search-filters". Returns a score (higher = better,
+/// rewarding contiguous runs and word-boundary hits) or nil when it doesn't match.
+enum WorkbenchFuzzy {
+    static func score(query: String, in text: String) -> Int? {
+        guard !query.isEmpty else { return 0 }
+        let q = Array(query.lowercased())
+        let t = Array(text.lowercased())
+        var qi = 0, score = 0, run = 0, ti = 0
+        while ti < t.count && qi < q.count {
+            if t[ti] == q[qi] {
+                run += 1
+                score += 1 + run
+                if ti == 0 || "/ -_.".contains(t[ti - 1]) { score += 3 } // word boundary
+                qi += 1
+            } else {
+                run = 0
+            }
+            ti += 1
+        }
+        return qi == q.count ? score : nil
+    }
+
+    /// Best score across a session's searchable fields, or nil if none match.
+    static func score(query: String, session: WorkbenchSessionRecord) -> Int? {
+        [session.displayTitle, session.cwd ?? "", session.id]
+            .compactMap { score(query: query, in: $0) }
+            .max()
+    }
+}
+
 /// Sidebar session filter. `all` hides archived; `archived` shows only archived.
 enum WorkbenchSessionFilter: String, CaseIterable, Sendable {
     case all, running, needsReview, favorite, archived

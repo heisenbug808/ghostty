@@ -164,6 +164,25 @@ final class WorkbenchTests: XCTestCase {
         XCTAssertTrue(WorkbenchSessionFilter.all.matches(waiting))
     }
 
+    // MARK: - Fuzzy search (quick-open)
+
+    func testFuzzySearchMatching() {
+        // Subsequence match across abbreviations / initials.
+        XCTAssertNotNil(WorkbenchFuzzy.score(query: "prsf", in: "partner-prm-search-filters"))
+        XCTAssertNotNil(WorkbenchFuzzy.score(query: "search", in: "partner-prm-search-filters"))
+        XCTAssertNil(WorkbenchFuzzy.score(query: "fsrp", in: "partner-prm-search-filters")) // wrong order → no match
+        XCTAssertNil(WorkbenchFuzzy.score(query: "xyz", in: "abc"))
+        XCTAssertEqual(WorkbenchFuzzy.score(query: "", in: "anything"), 0)
+        // A word-boundary (prefix) match outranks the same run mid-word.
+        let boundary = try! XCTUnwrap(WorkbenchFuzzy.score(query: "part", in: "partner-prm"))
+        let midWord = try! XCTUnwrap(WorkbenchFuzzy.score(query: "part", in: "xpartx"))
+        XCTAssertGreaterThan(boundary, midWord)
+        // Session-level: matches the best of title / cwd / id.
+        let session = WorkbenchSessionRecord(id: "abc123", cwd: "/Users/me/dev/webapp")
+        XCTAssertNotNil(WorkbenchFuzzy.score(query: "webapp", session: session))
+        XCTAssertNil(WorkbenchFuzzy.score(query: "zzzz", session: session))
+    }
+
     // MARK: - Lock staleness
 
     func testLockStalenessRespectsRunningAndGrace() {
