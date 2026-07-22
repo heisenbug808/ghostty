@@ -64,7 +64,7 @@ struct TerminalCommandPaletteView: View {
         // Sort the rest. We replace ":" with a character that sorts before space
         // so that "Foo:" sorts before "Foo Bar:". Use sortKey as a tie-breaker
         // for stable ordering when titles are equal.
-        options.append(contentsOf: (jumpOptions + terminalOptions).sorted { a, b in
+        options.append(contentsOf: (jumpOptions + terminalOptions + workbenchOptions).sorted { a, b in
             let aNormalized = a.title.replacingOccurrences(of: ":", with: "\t")
             let bNormalized = b.title.replacingOccurrences(of: ":", with: "\t")
             let comparison = aNormalized.localizedCaseInsensitiveCompare(bNormalized)
@@ -130,6 +130,31 @@ struct TerminalCommandPaletteView: View {
                     symbols: symbols
                 ) {
                     onAction(c.action)
+                }
+            }
+    }
+
+    /// Commands for resuming Claude Workbench sessions (feature-gated). Selecting
+    /// one focuses its existing window or resumes it in a new tab.
+    private var workbenchOptions: [CommandOption] {
+        guard WorkbenchFeature.isEnabled,
+              let ghostty = (NSApp.delegate as? AppDelegate)?.ghostty else { return [] }
+        let parent = surfaceView.window
+        return WorkbenchViewModel.shared.sessions
+            .filter { !$0.isArchived }
+            .prefix(50)
+            .map { session in
+                let running = session.status == .running
+                return CommandOption(
+                    title: "Resume: \(session.displayTitle)",
+                    subtitle: session.cwd.map { ($0 as NSString).lastPathComponent },
+                    leadingIcon: running ? "circle.fill" : "sparkles",
+                    leadingColor: running ? .green : nil,
+                    sortKey: AnySortKey(session.id)
+                ) {
+                    Task { @MainActor in
+                        await WorkbenchSessionLauncher.open(session, ghostty: ghostty, from: parent)
+                    }
                 }
             }
     }
