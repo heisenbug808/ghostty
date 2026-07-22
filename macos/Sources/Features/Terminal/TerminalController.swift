@@ -1077,9 +1077,17 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             focusedSurface = view
         }
 
-        // Initialize our content view to the SwiftUI root
+        // Initialize our content view to the SwiftUI root. The Workbench wrapper is
+        // feature-gated and preserves stock Ghostty behavior when disabled.
+        let workbenchModel = WorkbenchViewModel.shared
         let container = TerminalViewContainer {
-            TerminalView(ghostty: ghostty, viewModel: self, delegate: self)
+            WorkbenchTerminalRootView(
+                model: workbenchModel,
+                ghostty: ghostty,
+                parentWindowProvider: { [weak self] in self?.window }
+            ) {
+                TerminalView(ghostty: ghostty, viewModel: self, delegate: self)
+            }
         }
 
         // Set the initial content size on the container so that
@@ -1223,6 +1231,13 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         self.relabelTabs()
         self.fixTabBar()
         terminalViewContainer?.updateGlassTintOverlay(isKeyWindow: true)
+
+        // Keep the Workbench sidebar highlight in sync with the focused terminal:
+        // whichever session this tab is running becomes the selected row, or none
+        // (nil) when the focused window isn't a Workbench-launched session.
+        if WorkbenchFeature.isEnabled, let window {
+            WorkbenchViewModel.shared.selectedSessionID = WorkbenchSurfaceRegistry.shared.sessionId(for: window)
+        }
     }
 
     override func windowDidResignKey(_ notification: Notification) {
