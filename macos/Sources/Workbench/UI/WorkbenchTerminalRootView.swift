@@ -12,6 +12,9 @@ struct WorkbenchTerminalRootView<TerminalContent: View>: View {
     // Per-view alert state (must NOT live on the shared model, or the alert would
     // pop in every open window at once).
     @State private var launchBlock: WorkbenchViewModel.LaunchBlock?
+    // Persisted sidebar width, shared across all windows via UserDefaults so a drag
+    // in one window resizes them all and survives relaunch.
+    @AppStorage("workbench.sidebarWidth") private var sidebarWidth: Double = 280
     // The app-wide registry — the SAME instance TerminalController.windowDidBecomeKey
     // reads, so registering here actually drives the focus-follows highlight.
     private var surfaceRegistry: WorkbenchSurfaceRegistry { .shared }
@@ -39,7 +42,12 @@ struct WorkbenchTerminalRootView<TerminalContent: View>: View {
                             onForkSession: { launch(session: $0, fork: true) },
                             onLaunch: { launch(mode: $0) }
                         )
-                        Divider()
+                        .frame(width: sidebarWidth)
+                        WorkbenchResizeHandle(
+                            width: $sidebarWidth,
+                            minWidth: workbenchMinSidebarWidth,
+                            maxWidth: workbenchMaxSidebarWidth
+                        )
                         terminalContent
                     }
                 } else {
@@ -140,6 +148,44 @@ struct WorkbenchTerminalRootView<TerminalContent: View>: View {
                 surfaceRegistry.register(sessionId: sessionId, launchId: built.launchId, window: controller?.window)
             }
         }
+    }
+}
+
+private let workbenchMinSidebarWidth: Double = 220
+private let workbenchMaxSidebarWidth: Double = 480
+
+/// A 1pt divider with a wider invisible hit area that drags to resize the sidebar,
+/// showing the horizontal-resize cursor on hover — like a Ghostty split divider.
+private struct WorkbenchResizeHandle: View {
+    @Binding var width: Double
+    let minWidth: Double
+    let maxWidth: Double
+    // The width when the current drag began, so translation is applied to a stable base.
+    @State private var dragStartWidth: Double?
+
+    var body: some View {
+        Divider()
+            .overlay {
+                Color.clear
+                    .frame(width: 10)
+                    .contentShape(Rectangle())
+                    .onHover { hovering in
+                        if hovering {
+                            NSCursor.resizeLeftRight.push()
+                        } else {
+                            NSCursor.pop()
+                        }
+                    }
+                    .gesture(
+                        DragGesture(minimumDistance: 1)
+                            .onChanged { value in
+                                let base = dragStartWidth ?? width
+                                if dragStartWidth == nil { dragStartWidth = base }
+                                width = min(max(base + value.translation.width, minWidth), maxWidth)
+                            }
+                            .onEnded { _ in dragStartWidth = nil }
+                    )
+            }
     }
 }
 

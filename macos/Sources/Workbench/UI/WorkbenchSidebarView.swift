@@ -30,7 +30,7 @@ struct WorkbenchSidebarView: View {
             Divider()
             footer
         }
-        .frame(minWidth: 220, idealWidth: 280, maxWidth: 420)
+        .frame(maxWidth: .infinity)
         .background(Color(nsColor: .controlBackgroundColor))
         .alert("Rename Session", isPresented: renameBinding) {
             TextField("Display name", text: $renameText)
