@@ -100,6 +100,9 @@ final class FilesystemClaudeSessionIndexService: WorkbenchSessionIndexing {
         var customTitle: String?
         var aiTitle: String?
         var lastPrompt: String?
+        /// The opening request, which describes what the session is *about* — the
+        /// last prompt is usually trailing housekeeping.
+        var firstPrompt: String?
         var cwd: String?
         var messages = 0
         var lastWasAssistant: Bool?
@@ -117,7 +120,19 @@ final class FilesystemClaudeSessionIndexService: WorkbenchSessionIndexing {
             else { return }
 
             switch object["type"] as? String {
-            case "user": messages += 1; lastWasAssistant = false
+            case "user":
+                messages += 1
+                lastWasAssistant = false
+                // Keep the first prompt the user actually wrote: skip subagent
+                // transcripts, injected meta turns, and harness scaffolding.
+                if firstPrompt == nil,
+                   object["isSidechain"] as? Bool != true,
+                   object["isMeta"] as? Bool != true,
+                   let message = object["message"] as? [String: Any],
+                   let text = message["content"] as? String,
+                   !WorkbenchSessionLabel.isScaffolding(text) {
+                    firstPrompt = text
+                }
             case "assistant": messages += 1; lastWasAssistant = true
             case "custom-title": customTitle = (object["customTitle"] as? String) ?? customTitle
             case "ai-title": aiTitle = (object["aiTitle"] as? String) ?? (object["title"] as? String) ?? aiTitle
@@ -130,7 +145,12 @@ final class FilesystemClaudeSessionIndexService: WorkbenchSessionIndexing {
         }
 
         let meta = ScrapedMetadata(
-            title: customTitle ?? aiTitle,
+            // Claude Code's own title when it has one; otherwise a label built
+            // from the opening request, falling back to the last prompt only when
+            // the session never had a usable opening one.
+            title: customTitle ?? aiTitle
+                ?? WorkbenchSessionLabel.label(for: firstPrompt)
+                ?? WorkbenchSessionLabel.label(for: lastPrompt),
             summary: lastPrompt,
             cwd: cwd,
             messageCount: messages > 0 ? messages : nil,

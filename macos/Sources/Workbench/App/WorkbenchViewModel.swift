@@ -38,8 +38,13 @@ final class WorkbenchViewModel: ObservableObject {
         didSet {
             guard oldValue != searchText else { return }
             rebuildGroups()
+            scheduleContentSearch()
         }
     }
+    /// Sessions whose transcript contains the search text but whose title doesn't,
+    /// so searching can find a session by what was discussed in it.
+    @Published private(set) var contentHits: [WorkbenchTranscriptHit] = []
+    @Published private(set) var isSearchingContent = false
     @Published var statusMessage: String?
     /// Collapsed worktree groups, keyed by `WorkbenchWorktreeGroup.id`. Persisted
     /// so collapse state survives refreshes and relaunches.
@@ -69,6 +74,8 @@ final class WorkbenchViewModel: ObservableObject {
     private let collapseStore: WorkbenchGroupCollapseStore
     private let agentEvents: WorkbenchAgentEventService
     private let transcriptService = WorkbenchTranscriptService()
+    private let transcriptSearch = WorkbenchTranscriptSearchService()
+    private var contentSearchTask: Task<Void, Never>?
     private var fileWatcher: WorkbenchFileWatcher?
     private var isRefreshing = false
     private var refreshQueued = false
@@ -426,6 +433,55 @@ final class WorkbenchViewModel: ObservableObject {
                 title: session?.displayTitle ?? String(event.sessionId.prefix(12)),
                 state: state,
                 cwd: session?.cwd ?? event.cwd)
+        }
+    }
+
+    // MARK: - Content search
+
+    /// Debounces content search behind the title filter, which is instant. Typing
+    /// keeps cancelling and rescheduling, so only a settled query scans the corpus.
+    private func scheduleContentSearch() {
+        contentSearchTask?.cancel()
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard query.count >= 2 else {
+            contentHits = []
+            isSearchingContent = false
+            return
+        }
+
+        let targets = sessions.compactMap { session -> WorkbenchTranscriptSearchService.Target? in
+            guard let path = session.transcriptPath else { return nil }
+            return .init(
+                sessionId: session.id,
+                path: path,
+                modifiedAt: session.lastModifiedAt ?? .distantPast)
+        }
+        let service = transcriptSearch
+
+        isSearchingContent = true
+        contentSearchTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard !Task.isCancelled else { return }
+            let hits = (try? await service.search(query: query, in: targets)) ?? []
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self, self.searchText.trimmingCharacters(in: .whitespacesAndNewlines) == query
+                else { return }
+                self.contentHits = hits
+                self.isSearchingContent = false
+            }
+        }
+    }
+
+    /// Content hits for sessions the title filter didn't already surface, so the
+    /// two result lists don't repeat each other.
+    var contentOnlyHits: [(hit: WorkbenchTranscriptHit, session: WorkbenchSessionRecord)] {
+        let shown = Set(worktreeGroups.flatMap { $0.sessions.map(\.id) })
+        return contentHits.compactMap { hit in
+            guard !shown.contains(hit.sessionId),
+                  let session = sessions.first(where: { $0.id == hit.sessionId })
+            else { return nil }
+            return (hit, session)
         }
     }
 

@@ -299,6 +299,7 @@ struct WorkbenchSidebarView: View {
                         )
                     }
                 }
+                transcriptMatches
             }
             .listStyle(.sidebar)
             // Keyed on the two things that rewrite the list, never on the refresh
@@ -351,6 +352,58 @@ struct WorkbenchSidebarView: View {
         if !model.searchText.isEmpty { return "Try a different search." }
         if model.filter != .all { return "Switch back to All to see every session." }
         return "Use + to start one, or run claude in a terminal."
+    }
+
+    /// Sessions found by transcript content rather than title. Kept in its own
+    /// section so it's clear these matched on what was said inside them, and shown
+    /// only for sessions the title filter didn't already list.
+    @ViewBuilder
+    private var transcriptMatches: some View {
+        let matches = model.contentOnlyHits
+        if model.isSearchingContent || !matches.isEmpty {
+            Section {
+                if matches.isEmpty {
+                    Text("Searching…")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(theme.tertiary)
+                } else {
+                    ForEach(matches, id: \.hit.id) { match in
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 6) {
+                                WorkbenchStatusDot(session: match.session)
+                                Text(match.session.displayTitle)
+                                    .font(.system(size: 12))
+                                    .lineLimit(1)
+                                Spacer(minLength: 4)
+                                Text("\(match.hit.matchCount)")
+                                    .font(.system(size: 9.5))
+                                    .monospacedDigit()
+                                    .foregroundStyle(theme.tertiary)
+                            }
+                            Text(match.hit.snippet)
+                                .font(.system(size: 10))
+                                .foregroundStyle(theme.tertiary)
+                                .lineLimit(2)
+                        }
+                        .padding(.vertical, 3)
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) {
+                            model.select(match.session)
+                            onOpenSession(match.session)
+                        }
+                        .onTapGesture { model.select(match.session) }
+                    }
+                }
+            } header: {
+                HStack(spacing: 5) {
+                    Image(systemName: "text.magnifyingglass").font(.caption2)
+                    Text("In transcripts")
+                        .font(.system(size: 11, weight: .semibold))
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(theme.secondary)
+            }
+        }
     }
 
     private var footer: some View {
