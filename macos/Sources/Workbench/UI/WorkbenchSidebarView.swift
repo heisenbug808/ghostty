@@ -12,6 +12,7 @@ struct WorkbenchSidebarView: View {
     @State private var worktreeDirectory: String?
     @State private var worktreeName: String = ""
     @State private var endTarget: WorkbenchSessionRecord?
+    @State private var isConfirmingTitleGeneration = false
     // Mirrored into @State rather than read straight from UserDefaults so the
     // list re-renders the moment the menu changes it.
     @State private var density: WorkbenchDensity = WorkbenchFeature.density
@@ -51,6 +52,12 @@ struct WorkbenchSidebarView: View {
                 worktreeDirectory = nil
             }
             Button("Cancel", role: .cancel) { worktreeDirectory = nil }
+        }
+        .alert("Name Untitled Sessions?", isPresented: $isConfirmingTitleGeneration) {
+            Button("Name Sessions") { Task { await model.generateMissingTitles() } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Workbench will run the claude CLI once per session, reading the first few messages of each to name it. That uses your Claude quota and takes a few seconds each. \(model.sessionsNeedingTitles.count) session(s) have no title.")
         }
         .alert("End Session?", isPresented: endBinding, presenting: endTarget) { session in
             Button("End Session", role: .destructive) {
@@ -161,6 +168,15 @@ struct WorkbenchSidebarView: View {
                 Toggle("Notify When Awaiting Input", isOn: Binding(
                     get: { WorkbenchNotifier.notifyOnAwaitingInput },
                     set: { WorkbenchNotifier.notifyOnAwaitingInput = $0 }))
+            }
+            Section("Titles") {
+                let pending = model.sessionsNeedingTitles.count
+                Button(model.isGeneratingTitles
+                       ? "Naming sessions…"
+                       : "Name \(pending) Untitled Session(s)…") {
+                    isConfirmingTitleGeneration = true
+                }
+                .disabled(model.isGeneratingTitles || pending == 0)
             }
             Divider()
             // Rarely needed now that FSEvents drives updates, so it lives here

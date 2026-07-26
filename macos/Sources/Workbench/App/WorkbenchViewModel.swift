@@ -45,6 +45,7 @@ final class WorkbenchViewModel: ObservableObject {
     /// so searching can find a session by what was discussed in it.
     @Published private(set) var contentHits: [WorkbenchTranscriptHit] = []
     @Published private(set) var isSearchingContent = false
+    @Published private(set) var isGeneratingTitles = false
     @Published var statusMessage: String?
     /// Collapsed worktree groups, keyed by `WorkbenchWorktreeGroup.id`. Persisted
     /// so collapse state survives refreshes and relaunches.
@@ -75,6 +76,7 @@ final class WorkbenchViewModel: ObservableObject {
     private let agentEvents: WorkbenchAgentEventService
     private let transcriptService = WorkbenchTranscriptService()
     private let transcriptSearch = WorkbenchTranscriptSearchService()
+    private let titleGenerator = WorkbenchTitleGeneratorService()
     private var contentSearchTask: Task<Void, Never>?
     private var fileWatcher: WorkbenchFileWatcher?
     private var isRefreshing = false
@@ -434,6 +436,85 @@ final class WorkbenchViewModel: ObservableObject {
                 state: state,
                 cwd: session?.cwd ?? event.cwd)
         }
+    }
+
+    // MARK: - Generated titles
+
+    /// Sessions with no title of their own, which are the ones worth naming. A
+    /// session Claude Code titled, one the user renamed, or one already generated
+    /// is left alone.
+    var sessionsNeedingTitles: [WorkbenchSessionRecord] {
+        sessions.filter { session in
+            session.transcriptPath != nil
+                && (session.title?.isEmpty ?? true)
+                && (session.generatedTitle?.isEmpty ?? true)
+                && (session.localTitle?.isEmpty ?? true)
+                && !session.isArchived
+        }
+    }
+
+    /// Names untitled sessions by asking Claude to read each transcript's opening.
+    ///
+    /// Runs a couple at a time: each is a CLI invocation taking seconds, and
+    /// spawning dozens at once would swamp the machine for no gain. Progress is
+    /// reported as it goes and each title is persisted as it arrives, so stopping
+    /// part-way keeps what was already generated.
+    func generateMissingTitles() async {
+        let candidates = sessionsNeedingTitles
+        guard !candidates.isEmpty else {
+            statusMessage = "Every session already has a title"
+            return
+        }
+
+        isGeneratingTitles = true
+        defer { isGeneratingTitles = false }
+
+        let generator = titleGenerator
+        var completed = 0
+        var failed = 0
+
+        await withTaskGroup(of: (String, String?).self) { group in
+            var index = 0
+            let concurrency = 2
+
+            func addNext() {
+                guard index < candidates.count else { return }
+                let session = candidates[index]
+                index += 1
+                guard let path = session.transcriptPath else { return }
+                group.addTask {
+                    (session.id, try? await generator.title(forTranscriptAt: path))
+                }
+            }
+
+            for _ in 0..<min(concurrency, candidates.count) { addNext() }
+
+            while let (sessionId, title) = await group.next() {
+                if Task.isCancelled { group.cancelAll(); break }
+                completed += 1
+                if let title, !title.isEmpty {
+                    setGeneratedTitle(title, for: sessionId)
+                } else {
+                    failed += 1
+                }
+                statusMessage = "Naming sessions… \(completed)/\(candidates.count)"
+                addNext()
+            }
+        }
+
+        statusMessage = failed == 0
+            ? "Named \(completed) session(s)"
+            : "Named \(completed - failed) of \(completed); \(failed) failed"
+    }
+
+    private func setGeneratedTitle(_ title: String, for sessionId: String) {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        var updated = sessions[index]
+        updated.generatedTitle = title
+        updated.updatedAt = Date()
+        sessions[index] = updated
+        rebuildGroups()
+        Task { try? await store.updateSession(updated) }
     }
 
     // MARK: - Content search

@@ -106,10 +106,17 @@ struct WorkbenchSessionRecord: Identifiable, Codable, Hashable, Sendable {
     /// True when the last conversational message was the assistant's (Claude is
     /// waiting on the user). Drives `needsReview`.
     var lastMessageWasAssistant: Bool?
+    /// Label built from the opening prompt when Claude Code never titled the
+    /// session. Index-owned and ranked below a real title.
+    var derivedLabel: String?
     var forkedFromSessionId: String?
 
     // Workbench-owned fields. Index refresh must never overwrite these.
     var localTitle: String?
+    /// Title produced on request by asking Claude to name the session. Ranked
+    /// below the user's own rename and below Claude Code's own title, but above
+    /// the mechanically derived label.
+    var generatedTitle: String?
     var isPinned: Bool
     var isArchived: Bool
     var tags: [String]
@@ -138,8 +145,10 @@ struct WorkbenchSessionRecord: Identifiable, Codable, Hashable, Sendable {
         transcriptPath: String? = nil,
         messageCount: Int? = nil,
         lastMessageWasAssistant: Bool? = nil,
+        derivedLabel: String? = nil,
         forkedFromSessionId: String? = nil,
         localTitle: String? = nil,
+        generatedTitle: String? = nil,
         isPinned: Bool = false,
         isArchived: Bool = false,
         tags: [String] = [],
@@ -163,8 +172,10 @@ struct WorkbenchSessionRecord: Identifiable, Codable, Hashable, Sendable {
         self.transcriptPath = transcriptPath
         self.messageCount = messageCount
         self.lastMessageWasAssistant = lastMessageWasAssistant
+        self.derivedLabel = derivedLabel
         self.forkedFromSessionId = forkedFromSessionId
         self.localTitle = localTitle
+        self.generatedTitle = generatedTitle
         self.isPinned = isPinned
         self.isArchived = isArchived
         self.tags = tags
@@ -180,9 +191,14 @@ struct WorkbenchSessionRecord: Identifiable, Codable, Hashable, Sendable {
         self.updatedAt = updatedAt
     }
 
+    /// What the list shows, most authoritative first: the user's own name for it,
+    /// then Claude Code's title, then a generated one, then the label derived from
+    /// the opening prompt, and only then raw prompt text.
     var displayTitle: String {
         if let localTitle, !localTitle.isEmpty { return localTitle }
         if let title, !title.isEmpty { return title }
+        if let generatedTitle, !generatedTitle.isEmpty { return generatedTitle }
+        if let derivedLabel, !derivedLabel.isEmpty { return derivedLabel }
         if let summary, !summary.isEmpty { return summary }
         return String(id.prefix(12))
     }
@@ -221,6 +237,7 @@ struct WorkbenchSessionRecord: Identifiable, Codable, Hashable, Sendable {
         result.transcriptPath = indexed.transcriptPath ?? result.transcriptPath
         result.messageCount = indexed.messageCount ?? result.messageCount
         result.lastMessageWasAssistant = indexed.lastMessageWasAssistant ?? result.lastMessageWasAssistant
+        result.derivedLabel = indexed.derivedLabel ?? result.derivedLabel
         result.forkedFromSessionId = indexed.forkedFromSessionId ?? result.forkedFromSessionId
         if result.status == .unknown || result.status == .indexed || result.status == .idle {
             result.status = indexed.status
