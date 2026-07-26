@@ -84,8 +84,13 @@ struct WorkbenchTerminalRootView<TerminalContent: View>: View {
                                 }
                             }
                             .frame(width: detailsWidth)
+                            // Slide in from the edge it lives on rather than
+                            // appearing instantly and shoving the terminal aside.
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
                         }
                     }
+                    .animation(.spring(response: 0.28, dampingFraction: 0.85),
+                               value: model.isDetailsVisible)
                 } else {
                     // Sidebar hidden: keep an always-available affordance to reveal it
                     // again, since hiding it removes the in-sidebar toggle button and we

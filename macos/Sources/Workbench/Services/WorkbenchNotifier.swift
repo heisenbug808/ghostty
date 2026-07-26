@@ -16,7 +16,9 @@ final class WorkbenchNotifier {
 
     static let notifyOnCompleteKey = "Workbench.NotifyOnComplete"
     static let notifyOnAwaitingInputKey = "Workbench.NotifyOnAwaitingInput"
-    private static let sessionIdKey = "workbenchSessionId"
+    /// `nonisolated` because `workbenchSessionId(from:)` reads it from AppDelegate's
+    /// notification callbacks, which aren't main-actor isolated.
+    private nonisolated static let sessionIdKey = "workbenchSessionId"
 
     /// Default on, matching what you'd want from a background agent: tell me when
     /// it's done, and tell me when it's stuck waiting for me.

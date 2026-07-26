@@ -12,6 +12,9 @@ struct WorkbenchSidebarView: View {
     @State private var worktreeDirectory: String?
     @State private var worktreeName: String = ""
     @State private var endTarget: WorkbenchSessionRecord?
+    // Mirrored into @State rather than read straight from UserDefaults so the
+    // list re-renders the moment the menu changes it.
+    @State private var density: WorkbenchDensity = WorkbenchFeature.density
     @Environment(\.workbenchTheme) private var theme
 
     var body: some View {
@@ -27,6 +30,7 @@ struct WorkbenchSidebarView: View {
         .frame(maxWidth: .infinity)
         .background(WorkbenchChromeBackground())
         .foregroundStyle(theme.primary)
+        .onChange(of: density) { newValue in WorkbenchFeature.density = newValue }
         .alert("Rename Session", isPresented: renameBinding) {
             TextField("Display name", text: $renameText)
             Button("Save") {
@@ -142,6 +146,14 @@ struct WorkbenchSidebarView: View {
                      ? "Installed — sessions report live state"
                      : "Not installed — status is inferred")
             }
+            Section("Appearance") {
+                Picker("Row Density", selection: $density) {
+                    ForEach(WorkbenchDensity.allCases, id: \.self) { option in
+                        Text(option.label).tag(option)
+                    }
+                }
+                .pickerStyle(.inline)
+            }
             Section("Notifications") {
                 Toggle("Notify When Task Completes", isOn: Binding(
                     get: { WorkbenchNotifier.notifyOnComplete },
@@ -231,10 +243,14 @@ struct WorkbenchSidebarView: View {
                                     session: session,
                                     worktreePath: group.path,
                                     isSelected: model.selectedSessionID == session.id,
+                                    density: density,
                                     onPin: { model.togglePinned(session) },
                                     onArchive: { model.toggleArchived(session) }
                                 )
                                 .id(session.id)
+                                // Filtering/searching rewrites the list wholesale;
+                                // a fade keeps rows from snapping in and out.
+                                .transition(.opacity)
                                 .contentShape(Rectangle())
                                 // Double-click opens; a single click only selects, so
                                 // you can inspect a session in the details panel
@@ -285,6 +301,10 @@ struct WorkbenchSidebarView: View {
                 }
             }
             .listStyle(.sidebar)
+            // Keyed on the two things that rewrite the list, never on the refresh
+            // tick — otherwise every FSEvents poll would re-animate the sidebar.
+            .animation(.easeInOut(duration: 0.18), value: model.filter)
+            .animation(.easeInOut(duration: 0.18), value: model.searchText)
             .overlay {
                 if model.worktreeGroups.isEmpty { emptyState }
             }
@@ -364,7 +384,7 @@ private struct WorkbenchWorktreeHeader: View {
                     .animation(.easeInOut(duration: 0.15), value: isCollapsed)
                 Image(systemName: icon)
                     .font(.caption2)
-                    .foregroundStyle(theme.secondary)
+                    .foregroundStyle(hue)
                 Text(group.repoName)
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(theme.secondary)
@@ -379,7 +399,8 @@ private struct WorkbenchWorktreeHeader: View {
                         .truncationMode(.middle)
                         .padding(.horizontal, 4)
                         .padding(.vertical, 1)
-                        .background(RoundedRectangle(cornerRadius: 3).fill(theme.elevatedFill))
+                        .background(RoundedRectangle(cornerRadius: 3)
+                            .fill(hue.opacity(theme.isDark ? 0.20 : 0.13)))
                 }
                 if let dirty = group.dirty, dirty > 0 {
                     Text("±\(dirty)")
@@ -414,6 +435,26 @@ private struct WorkbenchWorktreeHeader: View {
         if !group.isGit { return "folder" }
         return group.isLinkedWorktree ? "arrow.triangle.branch" : "shippingbox"
     }
+
+    /// Keyed on `repoKey` rather than the group id so every worktree of one repo
+    /// shares a color — the branch pill is what distinguishes them.
+    private var hue: Color { workbenchGroupColor(group.repoKey, isDark: theme.isDark) }
+}
+
+/// A muted, stable per-repo color so a long list of groups can be scanned by
+/// eye. Swift's `hashValue` is seeded per process and would hand a repo a
+/// different color on every launch, so this hashes explicitly (FNV-1a).
+/// Saturation and brightness are pinned per appearance — a free-floating hue at
+/// full saturation reads as a rainbow and loses contrast at both extremes.
+private func workbenchGroupColor(_ key: String, isDark: Bool) -> Color {
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    for byte in key.utf8 {
+        hash = (hash ^ UInt64(byte)) &* 0x0000_0100_0000_01b3
+    }
+    return Color(
+        hue: Double(hash % 360) / 360,
+        saturation: isDark ? 0.42 : 0.55,
+        brightness: isDark ? 0.86 : 0.62)
 }
 
 private struct WorkbenchSessionRow: View {
@@ -421,6 +462,7 @@ private struct WorkbenchSessionRow: View {
     let session: WorkbenchSessionRecord
     var worktreePath: String = ""
     var isSelected: Bool = false
+    var density: WorkbenchDensity = .comfortable
     var onPin: () -> Void = {}
     var onArchive: () -> Void = {}
     @State private var hovering = false
@@ -476,7 +518,7 @@ private struct WorkbenchSessionRow: View {
                     .frame(minWidth: 40, alignment: .trailing)
                 }
                 // Only when it says something the group header doesn't already.
-                if let subtitle {
+                if density.showsSubtitle, let subtitle {
                     Text(subtitle)
                         .font(.system(size: 10.5))
                         .foregroundStyle(theme.tertiary)
@@ -485,7 +527,7 @@ private struct WorkbenchSessionRow: View {
                 }
             }
         }
-        .padding(.vertical, 5)
+        .padding(.vertical, density.rowPadding)
         .padding(.leading, 8)
         .padding(.trailing, 6)
         .background(
@@ -493,6 +535,9 @@ private struct WorkbenchSessionRow: View {
                 .fill(isSelected
                       ? theme.selectionFill
                       : (hovering ? theme.hoverFill : Color.clear))
+                // Only on selection: hover should stay instant, and a spring keyed
+                // on the whole row would replay on every refresh tick.
+                .animation(.spring(response: 0.25, dampingFraction: 0.8), value: isSelected)
         )
         // A leading accent bar makes the selected row readable at a glance even
         // against the terminal's own background tint.
@@ -502,6 +547,8 @@ private struct WorkbenchSessionRow: View {
                 .frame(width: 2.5)
                 .padding(.vertical, 3)
                 .opacity(isSelected ? 1 : 0)
+                .scaleEffect(y: isSelected ? 1 : 0.4, anchor: .center)
+                .animation(.spring(response: 0.25, dampingFraction: 0.8), value: isSelected)
         }
         .contentShape(Rectangle())
         .onHover { hovering = $0 }

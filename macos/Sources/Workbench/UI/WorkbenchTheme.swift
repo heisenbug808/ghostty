@@ -44,16 +44,20 @@ struct WorkbenchTheme: Equatable {
     init(config: Ghostty.Config) {
         let background = config.backgroundColor
         self.background = background
-        // Clamp: a fully transparent terminal would otherwise make the chrome
-        // unreadable, and values above 1 are meaningless.
-        self.opacity = min(max(config.backgroundOpacity, 0.35), 1)
-        self.isDark = Self.isDark(background)
+        self.opacity = Self.clampOpacity(config.backgroundOpacity)
+        self.isDark = Self.backgroundIsDark(background)
+    }
+
+    /// A fully transparent terminal would leave the chrome unreadable, and values
+    /// above 1 are meaningless.
+    static func clampOpacity(_ value: Double) -> Double {
+        min(max(value, 0.35), 1)
     }
 
     /// Relative luminance (Rec. 709) of the background, so the derived colors
     /// don't depend on the *system* appearance — a light terminal theme in dark
     /// mode still needs dark text.
-    private static func isDark(_ color: Color) -> Bool {
+    static func backgroundIsDark(_ color: Color) -> Bool {
         guard let srgb = NSColor(color).usingColorSpace(.sRGB) else {
             return NSApp.effectiveAppearance.isDarkMode
         }

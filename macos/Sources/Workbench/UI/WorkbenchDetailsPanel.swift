@@ -36,13 +36,9 @@ struct WorkbenchDetailsPanel: View {
         VStack(spacing: 0) {
             header
             Divider()
-            Picker("", selection: tab) {
-                ForEach(Tab.allCases) { Text($0.rawValue).tag($0) }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            WorkbenchTabBar(selection: tab)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
             Divider()
 
             switch tab.wrappedValue {
@@ -94,35 +90,34 @@ struct WorkbenchDetailsPanel: View {
 
     private var infoTab: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 16) {
                 actions
 
-                WorkbenchDetailSection("Session") {
-                    WorkbenchDetailRow("State", value: stateDescription)
-                    if let count = session.messageCount {
-                        WorkbenchDetailRow("Messages", value: "\(count)")
-                    }
-                    if let last = session.lastModifiedAt {
-                        WorkbenchDetailRow("Last active", value: last.formatted(date: .abbreviated, time: .shortened))
-                    }
-                    if let pid = session.runningPID {
-                        WorkbenchDetailRow("Process", value: "pid \(pid)")
-                    }
-                    WorkbenchDetailRow("ID", value: session.id, monospaced: true, copyable: true)
-                }
+                WorkbenchDetailSection("Session", rows: [
+                    WorkbenchDetailRow("State", value: stateDescription),
+                    session.messageCount.map { WorkbenchDetailRow("Messages", value: "\($0)") },
+                    session.lastModifiedAt.map {
+                        WorkbenchDetailRow("Last active", value: $0.formatted(date: .abbreviated, time: .shortened))
+                    },
+                    session.runningPID.map { WorkbenchDetailRow("Process", value: "pid \($0)") },
+                    WorkbenchDetailRow("ID", value: session.id, monospaced: true, copyable: true),
+                ])
 
-                WorkbenchDetailSection("Location") {
-                    if let cwd = session.cwd {
-                        WorkbenchDetailRow("Directory", value: cwd, monospaced: true, copyable: true)
-                    }
-                    if let path = session.transcriptPath {
-                        WorkbenchDetailRow("Transcript", value: path, monospaced: true, copyable: true)
-                    }
-                }
+                WorkbenchDetailSection("Location", rows: [
+                    session.cwd.map { WorkbenchDetailRow("Directory", value: $0, monospaced: true, copyable: true) },
+                    session.transcriptPath.map {
+                        WorkbenchDetailRow("Transcript", value: $0, monospaced: true, copyable: true)
+                    },
+                ])
 
                 if !session.tags.isEmpty {
-                    WorkbenchDetailSection("Tags") {
-                        Text(session.tags.joined(separator: ", ")).font(.caption)
+                    WorkbenchDetailCard(title: "Tags") {
+                        Text(session.tags.joined(separator: ", "))
+                            .font(.caption)
+                            .foregroundStyle(theme.secondary)
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 7)
                     }
                 }
             }
@@ -132,9 +127,12 @@ struct WorkbenchDetailsPanel: View {
 
     private var actions: some View {
         // Wraps on a narrow panel instead of clipping.
-        HStack(spacing: 8) {
-            Button(session.status == .running ? "Open" : "Resume", action: onResume)
-            Button("Fork", action: onFork)
+        HStack(spacing: 6) {
+            WorkbenchActionButton(
+                icon: session.status == .running ? "arrow.up.forward.app" : "play.fill",
+                title: session.status == .running ? "Open" : "Resume",
+                action: onResume)
+            WorkbenchActionButton(icon: "arrow.triangle.branch", title: "Fork", action: onFork)
             Menu {
                 Button("Rename…") {
                     renameText = session.localTitle ?? ""
@@ -156,12 +154,18 @@ struct WorkbenchDetailsPanel: View {
                 }
             } label: {
                 Image(systemName: "ellipsis")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(theme.secondary)
+                    .frame(width: 26, height: 22)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(theme.elevatedFill))
             }
             .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
             .fixedSize()
             Spacer(minLength: 0)
         }
-        .controlSize(.small)
     }
 
     private var stateDescription: String {
@@ -211,24 +215,20 @@ struct WorkbenchDetailsPanel: View {
         Group {
             if let gitInfo {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
-                        WorkbenchDetailSection("Repository") {
-                            if let origin = gitInfo.originName {
-                                WorkbenchDetailRow("Remote", value: origin)
-                            }
-                            WorkbenchDetailRow("Root", value: gitInfo.toplevel, monospaced: true, copyable: true)
+                    VStack(alignment: .leading, spacing: 16) {
+                        WorkbenchDetailSection("Repository", rows: [
+                            gitInfo.originName.map { WorkbenchDetailRow("Remote", value: $0) },
+                            WorkbenchDetailRow("Root", value: gitInfo.toplevel, monospaced: true, copyable: true),
                             WorkbenchDetailRow(
                                 "Checkout",
-                                value: gitInfo.isLinkedWorktree ? "Linked worktree" : "Main working tree")
-                        }
-                        WorkbenchDetailSection("Working tree") {
-                            WorkbenchDetailRow("Branch", value: gitInfo.branch ?? "detached", monospaced: true)
-                            if let dirty = gitInfo.dirty {
-                                WorkbenchDetailRow(
-                                    "Changes",
-                                    value: dirty == 0 ? "Clean" : "\(dirty) file(s) modified")
-                            }
-                        }
+                                value: gitInfo.isLinkedWorktree ? "Linked worktree" : "Main working tree"),
+                        ])
+                        WorkbenchDetailSection("Working tree", rows: [
+                            WorkbenchDetailRow("Branch", value: gitInfo.branch ?? "detached", monospaced: true),
+                            gitInfo.dirty.map {
+                                WorkbenchDetailRow("Changes", value: $0 == 0 ? "Clean" : "\($0) file(s) modified")
+                            },
+                        ])
                     }
                     .padding(12)
                 }
@@ -270,32 +270,146 @@ struct WorkbenchStatusDot: View {
     }
 }
 
-private struct WorkbenchDetailSection<Content: View>: View {
+/// Tab strip for the panel. The stock segmented picker reads as a System Settings
+/// control dropped into the terminal; this one is built from the same tokens as
+/// the rest of the chrome so it belongs to the window.
+private struct WorkbenchTabBar: View {
+    @Binding var selection: WorkbenchDetailsPanel.Tab
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(WorkbenchDetailsPanel.Tab.allCases) { tab in
+                WorkbenchTabButton(title: tab.rawValue, isSelected: selection == tab) {
+                    selection = tab
+                }
+            }
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+private struct WorkbenchTabButton: View {
+    let title: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    @Environment(\.workbenchTheme) private var theme
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 11, weight: isSelected ? .semibold : .regular))
+                .foregroundStyle(isSelected ? theme.primary : theme.secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(isSelected ? theme.selectionFill : (isHovering ? theme.hoverFill : .clear)))
+                // The label alone leaves dead space inside the pill.
+                .contentShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+}
+
+/// Icon + label button sized like a toolbar item rather than a dialog button, so
+/// the actions sit inside the panel instead of looking like a sheet's footer.
+private struct WorkbenchActionButton: View {
+    let icon: String
+    let title: String
+    let action: () -> Void
+
+    @Environment(\.workbenchTheme) private var theme
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: icon).font(.system(size: 10, weight: .semibold))
+                Text(title).font(.system(size: 11, weight: .medium))
+            }
+            .foregroundStyle(theme.primary)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(theme.elevatedFill)
+                    // Layered rather than swapped: the two fills are within 0.01
+                    // alpha of each other, so replacing one with the other would
+                    // read as no hover at all.
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(isHovering ? theme.hoverFill : .clear)))
+            .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+    }
+}
+
+/// Titled card: a raised surface holding related rows, so the info tab reads as
+/// a few groups instead of one long `label: value` list.
+private struct WorkbenchDetailCard<Content: View>: View {
     let title: String
     @ViewBuilder let content: Content
 
-    init(_ title: String, @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.content = content()
-    }
+    @Environment(\.workbenchTheme) private var theme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title.uppercased())
                 .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(theme.tertiary)
                 .kerning(0.6)
-            VStack(alignment: .leading, spacing: 5) { content }
+                .padding(.leading, 2)
+            VStack(alignment: .leading, spacing: 0) { content }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(theme.elevatedFill))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(theme.separator, lineWidth: 1))
         }
     }
 }
 
-private struct WorkbenchDetailRow: View {
+private struct WorkbenchDetailSection: View {
+    let title: String
+    let rows: [WorkbenchDetailRow?]
+
+    init(_ title: String, rows: [WorkbenchDetailRow?]) {
+        self.title = title
+        self.rows = rows
+    }
+
+    var body: some View {
+        let visible = rows.compactMap { $0 }
+        // An all-optional group (a session with neither cwd nor transcript) would
+        // otherwise leave a titled empty card behind.
+        return Group {
+            if !visible.isEmpty {
+                WorkbenchDetailCard(title: title) {
+                    ForEach(visible.indices, id: \.self) { index in
+                        if index > 0 { WorkbenchHairline() }
+                        WorkbenchDetailRowView(row: visible[index])
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Rows are data, not views, so the card can put separators *between* them
+/// without a trailing line under the last one.
+private struct WorkbenchDetailRow {
     let label: String
     let value: String
     var monospaced = false
     var copyable = false
-    @State private var copied = false
 
     init(_ label: String, value: String, monospaced: Bool = false, copyable: Bool = false) {
         self.label = label
@@ -303,33 +417,63 @@ private struct WorkbenchDetailRow: View {
         self.monospaced = monospaced
         self.copyable = copyable
     }
+}
+
+/// Hairline instead of `Divider()`: a divider paints a system separator color that
+/// ignores the terminal theme and insets itself unpredictably inside a card.
+private struct WorkbenchHairline: View {
+    @Environment(\.workbenchTheme) private var theme
+
+    var body: some View {
+        Rectangle()
+            .fill(theme.separator)
+            .frame(height: 1)
+            .padding(.leading, 10)
+    }
+}
+
+private struct WorkbenchDetailRowView: View {
+    let row: WorkbenchDetailRow
+
+    @Environment(\.workbenchTheme) private var theme
+    @State private var copied = false
+    @State private var isHovering = false
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(label)
+            Text(row.label)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(theme.secondary)
                 .frame(width: 72, alignment: .leading)
-            Text(copied ? "Copied" : value)
-                .font(monospaced ? .system(size: 11, design: .monospaced) : .caption)
-                .foregroundStyle(copied ? Color.accentColor : Color.primary)
+            Text(copied ? "Copied" : row.value)
+                .font(row.monospaced ? .system(size: 11, design: .monospaced) : .caption)
+                .foregroundStyle(copied ? theme.accent : theme.primary)
                 .textSelection(.enabled)
                 .lineLimit(3)
                 .truncationMode(.middle)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            if copyable {
+            if row.copyable {
                 Button {
                     NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(value, forType: .string)
+                    NSPasteboard.general.setString(row.value, forType: .string)
                     copied = true
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copied = false }
                 } label: {
-                    Image(systemName: "doc.on.doc").font(.system(size: 9))
+                    Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 9))
+                        // Dimmed until the row is hovered rather than hidden: a
+                        // card of paths shouldn't read as a column of icons, but
+                        // the affordance still has to be findable without hover.
+                        .foregroundStyle(copied ? theme.accent : (isHovering ? theme.secondary : theme.tertiary))
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.plain)
                 .help("Copy")
             }
         }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
     }
 }
 

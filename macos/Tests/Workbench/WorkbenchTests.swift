@@ -1,3 +1,4 @@
+import SwiftUI
 import XCTest
 @testable import Ghostty
 
@@ -635,6 +636,53 @@ final class WorkbenchTests: XCTestCase {
         // Archived always wins.
         session.isArchived = true
         XCTAssertFalse(session.needsReview)
+    }
+
+    // MARK: - Theme
+
+    /// The whole point of deriving chrome colors from the terminal is that a dark
+    /// terminal gets dark chrome. Luminance decides it — not the system
+    /// appearance — so a light terminal theme while macOS is in dark mode still
+    /// gets dark-on-light chrome, and vice versa.
+    func testThemeDarknessFollowsBackgroundLuminanceNotSystemAppearance() {
+        let dark = WorkbenchTheme(background: Color(red: 0.07, green: 0.07, blue: 0.10), opacity: 1, isDark: true)
+        XCTAssertTrue(dark.isDark)
+
+        // Derived via the real initializer path (luminance), for a range of colors.
+        func isDark(_ red: Double, _ green: Double, _ blue: Double) -> Bool {
+            WorkbenchTheme(
+                background: Color(red: red, green: green, blue: blue),
+                opacity: 1,
+                isDark: WorkbenchTheme.backgroundIsDark(Color(red: red, green: green, blue: blue))
+            ).isDark
+        }
+
+        XCTAssertTrue(isDark(0, 0, 0), "black background")
+        XCTAssertTrue(isDark(0.07, 0.07, 0.10), "typical dark terminal theme")
+        XCTAssertTrue(isDark(0.15, 0.11, 0.20), "dark purple theme")
+        XCTAssertFalse(isDark(1, 1, 1), "white background")
+        XCTAssertFalse(isDark(0.98, 0.96, 0.93), "solarized-light-ish background")
+
+        // Green dominates perceived luminance, blue barely registers: pure blue is
+        // dark, pure green is not. A naive average would get both wrong.
+        XCTAssertTrue(isDark(0, 0, 1), "pure blue reads as dark")
+        XCTAssertFalse(isDark(0, 1, 0), "pure green reads as light")
+    }
+
+    func testThemeClampsOpacityToStayLegible() {
+        // A fully transparent terminal would otherwise leave unreadable chrome.
+        XCTAssertEqual(WorkbenchTheme.clampOpacity(0), 0.35, accuracy: 0.001)
+        XCTAssertEqual(WorkbenchTheme.clampOpacity(0.2), 0.35, accuracy: 0.001)
+        XCTAssertEqual(WorkbenchTheme.clampOpacity(0.8), 0.8, accuracy: 0.001)
+        XCTAssertEqual(WorkbenchTheme.clampOpacity(1), 1, accuracy: 0.001)
+        XCTAssertEqual(WorkbenchTheme.clampOpacity(1.5), 1, accuracy: 0.001)
+    }
+
+    func testDensityDrivesRowPaddingAndSubtitle() {
+        XCTAssertTrue(WorkbenchDensity.comfortable.showsSubtitle)
+        XCTAssertFalse(WorkbenchDensity.compact.showsSubtitle)
+        XCTAssertLessThan(WorkbenchDensity.compact.rowPadding, WorkbenchDensity.comfortable.rowPadding)
+        XCTAssertEqual(WorkbenchDensity(rawValue: "compact"), .compact)
     }
 
     // MARK: - Transcript reader
