@@ -58,9 +58,19 @@ final class WorkbenchViewModel: ObservableObject {
     private let runningState: WorkbenchRunningStateReading
     private let gitService: WorkbenchGitReading
     private let collapseStore: WorkbenchGroupCollapseStore
+    private let agentEvents: WorkbenchAgentEventService
     private var fileWatcher: WorkbenchFileWatcher?
     private var isRefreshing = false
     private var refreshQueued = false
+
+    private struct AgentStateStamp {
+        var state: WorkbenchAgentState
+        var at: Date
+    }
+
+    /// Hook-reported agent state per session. In-memory only: it reflects live
+    /// events, so a value persisted across a restart would be a lie.
+    private var agentStates: [String: AgentStateStamp] = [:]
 
     /// Transient git facts keyed by cwd, recomputed each refresh (never persisted).
     private var gitInfoByCwd: [String: WorkbenchGitInfo] = [:]
@@ -73,18 +83,21 @@ final class WorkbenchViewModel: ObservableObject {
         indexer: WorkbenchSessionIndexing = FilesystemClaudeSessionIndexService(),
         runningState: WorkbenchRunningStateReading = FilesystemRunningStateService(),
         gitService: WorkbenchGitReading = WorkbenchGitService(),
-        collapseStore: WorkbenchGroupCollapseStore = WorkbenchGroupCollapseStore()
+        collapseStore: WorkbenchGroupCollapseStore = WorkbenchGroupCollapseStore(),
+        agentEvents: WorkbenchAgentEventService = WorkbenchAgentEventService()
     ) {
         self.store = store
         self.indexer = indexer
         self.runningState = runningState
         self.gitService = gitService
         self.collapseStore = collapseStore
+        self.agentEvents = agentEvents
         self.collapsedGroupIDs = collapseStore.load()
         // Do not touch disk (index/scan) unless the feature is actually enabled.
         // This keeps "feature disabled" behavior identical to stock Ghostty:
         // constructing the model must have zero filesystem side effects.
         guard WorkbenchFeature.isEnabled else { return }
+        agentEvents.ensureDirectoryExists()
         Task { await refresh() }
         startFileWatcher()
     }
@@ -109,6 +122,9 @@ final class WorkbenchViewModel: ObservableObject {
         let paths = [
             base.appendingPathComponent("sessions", isDirectory: true).path,
             base.appendingPathComponent("projects", isDirectory: true).path,
+            // Hook events land here; watching them makes state changes near-instant
+            // instead of waiting for the next transcript write.
+            agentEvents.directory.path,
         ]
         fileWatcher = WorkbenchFileWatcher(paths: paths) { [weak self] in
             Task { @MainActor in await self?.refresh() }
@@ -160,6 +176,9 @@ final class WorkbenchViewModel: ObservableObject {
                 Task { await self.refresh() }
             }
         }
+        // Consume hook events first so this pass reflects the newest pushed state.
+        drainAgentEvents()
+
         do {
             let snapshot = try await store.loadSnapshot()
             sessions = snapshot.sessions
@@ -184,6 +203,10 @@ final class WorkbenchViewModel: ObservableObject {
                 let isLive = running[session.id] != nil || activeLockSessions.contains(session.id)
                 guard indexedIDs.contains(session.id) || isLive else { return nil }
                 var session = session
+                // Assigned unconditionally (including nil) so a value that got
+                // persisted can never outlive the live event that produced it.
+                session.agentState = agentStates[session.id]?.state
+                session.agentStateAt = agentStates[session.id]?.at
                 if let info = running[session.id] {
                     session.status = .running
                     session.runningPID = info.pid
@@ -370,6 +393,58 @@ final class WorkbenchViewModel: ObservableObject {
 
     /// Releases stale locks and returns the set of session ids that still hold a
     /// valid lock (so their `.launching` state is preserved during process boot).
+    /// Applies pending Claude Code hook events, then notifies for sessions that just
+    /// became "waiting on you". Only *transitions* notify, so a session sitting idle
+    /// can't re-notify on every refresh.
+    private func drainAgentEvents() {
+        for event in agentEvents.drain() {
+            guard let state = event.state else { continue }
+            let previous = agentStates[event.sessionId]?.state
+
+            if state == .ended {
+                agentStates.removeValue(forKey: event.sessionId)
+                WorkbenchNotifier.shared.clear(sessionId: event.sessionId)
+                continue
+            }
+
+            agentStates[event.sessionId] = AgentStateStamp(state: state, at: event.receivedAt)
+            guard state != previous, state.isWaitingOnUser else { continue }
+
+            let session = sessions.first { $0.id == event.sessionId }
+            WorkbenchNotifier.shared.notify(
+                sessionId: event.sessionId,
+                title: session?.displayTitle ?? String(event.sessionId.prefix(12)),
+                state: state,
+                cwd: session?.cwd ?? event.cwd)
+        }
+    }
+
+    // MARK: - Hook integration
+
+    var isHookInstalled: Bool { WorkbenchHookInstaller().isInstalled }
+
+    /// Installs (or removes) the Claude Code hook that pushes session state here.
+    /// Additive: it appends its own hook entries and leaves other tools' hooks alone,
+    /// backing up `settings.json` first.
+    func setHookInstalled(_ install: Bool) async {
+        let installer = WorkbenchHookInstaller()
+        do {
+            if install {
+                try installer.install()
+                agentEvents.ensureDirectoryExists()
+                WorkbenchNotifier.shared.requestAuthorizationIfNeeded()
+                statusMessage = "Agent status hook installed — new sessions will report live state"
+            } else {
+                try installer.uninstall()
+                agentStates.removeAll()
+                statusMessage = "Agent status hook removed"
+            }
+        } catch {
+            statusMessage = "Hook setup failed: \(error.localizedDescription)"
+        }
+        await refresh()
+    }
+
     private func reconcileLocks(
         _ locks: [String: WorkbenchSessionLock],
         running: [String: WorkbenchRunningInfo]

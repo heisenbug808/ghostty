@@ -116,6 +116,10 @@ struct WorkbenchSessionRecord: Identifiable, Codable, Hashable, Sendable {
 
     // Runtime fields.
     var status: WorkbenchSessionStatus
+    /// Last state the Claude Code hook reported for this session, if the hook is
+    /// installed. Authoritative — see `needsReview`.
+    var agentState: WorkbenchAgentState?
+    var agentStateAt: Date?
     var lastLaunchId: String?
     var runningPID: Int32?
     var lastExitCode: Int32?
@@ -140,6 +144,8 @@ struct WorkbenchSessionRecord: Identifiable, Codable, Hashable, Sendable {
         isArchived: Bool = false,
         tags: [String] = [],
         status: WorkbenchSessionStatus = .indexed,
+        agentState: WorkbenchAgentState? = nil,
+        agentStateAt: Date? = nil,
         lastLaunchId: String? = nil,
         runningPID: Int32? = nil,
         lastExitCode: Int32? = nil,
@@ -163,6 +169,8 @@ struct WorkbenchSessionRecord: Identifiable, Codable, Hashable, Sendable {
         self.isArchived = isArchived
         self.tags = tags
         self.status = status
+        self.agentState = agentState
+        self.agentStateAt = agentStateAt
         self.lastLaunchId = lastLaunchId
         self.runningPID = runningPID
         self.lastExitCode = lastExitCode
@@ -184,12 +192,20 @@ struct WorkbenchSessionRecord: Identifiable, Codable, Hashable, Sendable {
     /// from, so they shouldn't clutter the signal.
     static let needsReviewWindow: TimeInterval = 24 * 60 * 60
 
-    /// A session worth returning to: not running, not archived, Claude replied
-    /// last (waiting on the user), AND it was active within the recency window.
+    /// A session worth returning to.
+    ///
+    /// When the Claude Code hook has reported this session's state we trust it
+    /// outright — the agent itself told us whether it's working or waiting on the
+    /// user, which is exactly the question. Only sessions with no hook data fall
+    /// back to inferring it from transcript shape (Claude spoke last, recently),
+    /// which over-reports because "Claude replied last" isn't the same as
+    /// "Claude needs you".
     var needsReview: Bool { needsReview(now: Date()) }
 
     func needsReview(now: Date) -> Bool {
-        guard status != .running, !isArchived, lastMessageWasAssistant == true,
+        guard !isArchived else { return false }
+        if let agentState { return agentState.isWaitingOnUser }
+        guard status != .running, lastMessageWasAssistant == true,
               let lastModifiedAt else { return false }
         return now.timeIntervalSince(lastModifiedAt) < Self.needsReviewWindow
     }

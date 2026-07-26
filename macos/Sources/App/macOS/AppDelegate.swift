@@ -887,6 +887,14 @@ class AppDelegate: NSObject,
         didReceive: UNNotificationResponse,
         withCompletionHandler: () -> Void
     ) {
+        // Workbench notifications aren't attached to a surface, so they'd fall
+        // through Ghostty's surface lookup. Let Workbench route them itself.
+        if let sessionId = WorkbenchNotifier.workbenchSessionId(from: didReceive.notification) {
+            Task { @MainActor in WorkbenchNotifier.shared.focus(sessionId: sessionId) }
+            withCompletionHandler()
+            return
+        }
+
         ghostty.handleUserNotification(response: didReceive)
         withCompletionHandler()
     }
@@ -896,6 +904,13 @@ class AppDelegate: NSObject,
         willPresent: UNNotification,
         withCompletionHandler: (UNNotificationPresentationOptions) -> Void
     ) {
+        // Ditto: `shouldPresentNotification` requires a surface in userInfo, so
+        // without this a Workbench banner would be silently dropped in-app.
+        if WorkbenchNotifier.workbenchSessionId(from: willPresent) != nil {
+            withCompletionHandler([.banner, .sound])
+            return
+        }
+
         let shouldPresent = ghostty.shouldPresentNotification(notification: willPresent)
         let options: UNNotificationPresentationOptions = shouldPresent ? [.banner, .sound] : []
         withCompletionHandler(options)

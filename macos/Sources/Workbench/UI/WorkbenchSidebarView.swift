@@ -126,9 +126,40 @@ struct WorkbenchSidebarView: View {
             }
             .buttonStyle(.borderless)
             .help("Refresh Claude sessions")
+            settingsMenu
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
+    }
+
+    /// Agent-status hook + notification preferences. The hook is what lets sessions
+    /// push their real state (working / waiting on you) instead of Workbench
+    /// inferring it from the transcript.
+    private var settingsMenu: some View {
+        Menu {
+            let installed = model.isHookInstalled
+            Section("Agent Status") {
+                Button(installed ? "Remove Status Hook…" : "Install Status Hook…") {
+                    Task { await model.setHookInstalled(!installed) }
+                }
+                Text(installed
+                     ? "Installed — sessions report live state"
+                     : "Not installed — status is inferred")
+            }
+            Section("Notifications") {
+                Toggle("Notify When Task Completes", isOn: Binding(
+                    get: { WorkbenchNotifier.notifyOnComplete },
+                    set: { WorkbenchNotifier.notifyOnComplete = $0 }))
+                Toggle("Notify When Awaiting Input", isOn: Binding(
+                    get: { WorkbenchNotifier.notifyOnAwaitingInput },
+                    set: { WorkbenchNotifier.notifyOnAwaitingInput = $0 }))
+            }
+        } label: {
+            Image(systemName: "gearshape")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Workbench settings")
     }
 
     private var search: some View {
@@ -450,11 +481,11 @@ private struct WorkbenchSessionRow: View {
                             .font(.caption2)
                             .foregroundStyle(.blue)
                     }
-                    if session.needsReview {
-                        Image(systemName: "exclamationmark.bubble.fill")
+                    if let badge = agentBadge {
+                        Image(systemName: badge.icon)
                             .font(.caption2)
-                            .foregroundStyle(.orange)
-                            .help("Claude replied — waiting on you")
+                            .foregroundStyle(badge.color)
+                            .help(badge.help)
                     }
                     Spacer(minLength: 4)
                     // Reserved trailing area: relative time at rest, quick actions
@@ -500,6 +531,25 @@ private struct WorkbenchSessionRow: View {
         )
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
+    }
+
+    /// Glyph describing what the agent is doing. Prefers the state the Claude Code
+    /// hook pushed; falls back to the inferred `needsReview` for sessions with no
+    /// hook data (which is why its wording is hedged).
+    private var agentBadge: (icon: String, color: Color, help: String)? {
+        switch session.agentState {
+        case .awaitingInput:
+            return ("hand.raised.fill", .orange, "Needs your approval")
+        case .idle:
+            return ("exclamationmark.bubble.fill", .orange, "Finished — waiting on you")
+        case .working:
+            return ("bolt.horizontal.fill", .blue, "Claude is working")
+        case .ended:
+            return nil
+        case .none:
+            guard session.needsReview else { return nil }
+            return ("exclamationmark.bubble", .orange, "Claude replied last — may be waiting on you")
+        }
     }
 
     /// Compact relative time (now / 5m / 3h / 2d) from last activity.

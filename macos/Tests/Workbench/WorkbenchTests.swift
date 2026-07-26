@@ -499,9 +499,22 @@ final class WorkbenchTests: XCTestCase {
             WorkbenchLaunchRequest(mode: .resume(sessionId: "abc123", cwd: "/tmp/proj"))
         )
         XCTAssertEqual(built.displayCommand, "claude --resume abc123")
-        XCTAssertEqual(built.command, "claude --resume abc123")
         XCTAssertEqual(built.workingDirectory, "/tmp/proj")
         XCTAssertEqual(built.sessionId, "abc123")
+    }
+
+    /// The executed command must run through a login shell (so a Dock-launched app
+    /// picks up the user's PATH and can find `claude`) and must clear the
+    /// child-session marker (so spawned sessions are first-class: transcript saved
+    /// and registered in ~/.claude/sessions). `displayCommand` stays human-readable.
+    func testLauncherWrapsCommandInLoginShellAndClearsChildMarker() {
+        let built = WorkbenchLauncherService().build(
+            WorkbenchLaunchRequest(mode: .resume(sessionId: "abc123", cwd: nil))
+        )
+        XCTAssertEqual(built.displayCommand, "claude --resume abc123")
+        XCTAssertTrue(built.command.contains(" -l -c "), built.command)
+        XCTAssertTrue(built.command.contains("unset CLAUDE_CODE_CHILD_SESSION"), built.command)
+        XCTAssertTrue(built.command.contains("exec claude --resume abc123"), built.command)
     }
 
     func testLauncherBuildsForkCommand() {
@@ -529,5 +542,243 @@ final class WorkbenchTests: XCTestCase {
             WorkbenchLaunchRequest(mode: .new(projectPath: "/tmp", prompt: "hello world"))
         )
         XCTAssertEqual(built.displayCommand, "claude 'hello world'")
+    }
+
+    // MARK: - Agent state (hook events)
+
+    func testAgentEventStateMapping() {
+        func event(_ name: String, notification: String? = nil) -> WorkbenchAgentEvent {
+            WorkbenchAgentEvent(
+                sessionId: "s1", event: name, cwd: nil,
+                notificationType: notification, source: nil, reason: nil, receivedAt: Date())
+        }
+
+        XCTAssertEqual(event("UserPromptSubmit").state, .working)
+        XCTAssertEqual(event("SessionStart").state, .working)
+        XCTAssertEqual(event("Stop").state, .idle)
+        XCTAssertEqual(event("PermissionRequest").state, .awaitingInput)
+        XCTAssertEqual(event("SessionEnd").state, .ended)
+        XCTAssertEqual(event("Notification", notification: "permission_prompt").state, .awaitingInput)
+        XCTAssertEqual(event("Notification", notification: "agent_needs_input").state, .awaitingInput)
+        XCTAssertEqual(event("Notification", notification: "idle_prompt").state, .idle)
+        // Noise we must not turn into a "waiting on you" signal.
+        XCTAssertNil(event("Notification", notification: "auth_success").state)
+        XCTAssertNil(event("PostToolUse").state)
+
+        XCTAssertTrue(WorkbenchAgentState.idle.isWaitingOnUser)
+        XCTAssertTrue(WorkbenchAgentState.awaitingInput.isWaitingOnUser)
+        XCTAssertFalse(WorkbenchAgentState.working.isWaitingOnUser)
+    }
+
+    func testAgentEventServiceDrainsConsumesAndPrunes() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wb-events-\(UUID().uuidString)", isDirectory: true)
+        let service = WorkbenchAgentEventService(directory: dir)
+        service.ensureDirectoryExists()
+
+        func write(_ name: String, _ json: String, ageSeconds: TimeInterval = 0) throws {
+            let url = dir.appendingPathComponent(name)
+            try json.write(to: url, atomically: true, encoding: .utf8)
+            if ageSeconds > 0 {
+                try FileManager.default.setAttributes(
+                    [.modificationDate: Date().addingTimeInterval(-ageSeconds)],
+                    ofItemAtPath: url.path)
+            }
+        }
+
+        try write("a.json", #"{"session_id":"s1","hook_event_name":"Stop","cwd":"/w"}"#)
+        try write("b.json", #"{"hook_event_name":"Stop"}"#)                       // no session_id
+        try write("c.json", "not json at all")                                     // malformed
+        try write("d.json", #"{"session_id":"old","hook_event_name":"Stop"}"#,
+                  ageSeconds: WorkbenchAgentEventService.maxEventAge + 60)         // too old
+        try write("e.txt", #"{"session_id":"s2","hook_event_name":"Stop"}"#)       // wrong extension
+
+        let events = service.drain()
+        XCTAssertEqual(events.map(\.sessionId), ["s1"])
+        XCTAssertEqual(events.first?.cwd, "/w")
+
+        // Everything it looked at is consumed (including the junk), so a bad event
+        // can't be re-read forever. The non-.json file is left alone.
+        let remaining = try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted()
+        XCTAssertEqual(remaining, ["e.txt"])
+        XCTAssertTrue(service.drain().isEmpty)
+
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    /// Hook state is authoritative; the transcript-shape heuristic is only a
+    /// fallback for sessions the hook has never reported on.
+    func testNeedsReviewPrefersHookStateOverHeuristic() {
+        // Heuristic would say "needs review" (Claude spoke last, recent)...
+        var session = WorkbenchSessionRecord(id: "s1", status: .idle)
+        session.lastMessageWasAssistant = true
+        session.lastModifiedAt = Date()
+        XCTAssertTrue(session.needsReview)
+
+        // ...but the hook says Claude is still working, so it must not.
+        session.agentState = .working
+        XCTAssertFalse(session.needsReview)
+
+        session.agentState = .idle
+        XCTAssertTrue(session.needsReview)
+        session.agentState = .awaitingInput
+        XCTAssertTrue(session.needsReview)
+        session.agentState = .ended
+        XCTAssertFalse(session.needsReview)
+
+        // A running session that the hook says is waiting on input still counts,
+        // which the old status-based guard would have missed.
+        session.status = .running
+        session.agentState = .awaitingInput
+        XCTAssertTrue(session.needsReview)
+
+        // Archived always wins.
+        session.isArchived = true
+        XCTAssertFalse(session.needsReview)
+    }
+
+    // MARK: - Hook installer
+
+    private func makeInstaller() -> (WorkbenchHookInstaller, URL) {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wb-claude-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        var installer = WorkbenchHookInstaller()
+        installer.claudeDirectory = root
+        return (installer, root)
+    }
+
+    private func readHooks(_ installer: WorkbenchHookInstaller) throws -> [String: Any] {
+        let data = try Data(contentsOf: installer.settingsURL)
+        let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return object?["hooks"] as? [String: Any] ?? [:]
+    }
+
+    /// The critical safety property: installing must not disturb hooks another tool
+    /// already registered (the user's real settings.json has several), and must
+    /// leave unrelated top-level settings untouched.
+    func testHookInstallMergesWithoutClobberingForeignHooks() throws {
+        let (installer, _) = makeInstaller()
+        let existing = """
+        {
+          "model": "opus",
+          "hooks": {
+            "Stop": [
+              { "hooks": [ { "type": "command", "command": "/other/tool-bridge" } ] }
+            ],
+            "PostToolUse": [
+              { "matcher": "Edit|Write", "hooks": [ { "type": "command", "command": "/other/vet.sh" } ] }
+            ]
+          }
+        }
+        """
+        try existing.write(to: installer.settingsURL, atomically: true, encoding: .utf8)
+
+        XCTAssertFalse(installer.isInstalled)
+        try installer.install()
+        XCTAssertTrue(installer.isInstalled)
+
+        let hooks = try readHooks(installer)
+
+        // Foreign Stop hook survives, ours is appended alongside it.
+        let stop = hooks["Stop"] as? [[String: Any]] ?? []
+        XCTAssertEqual(stop.count, 2)
+        let stopCommands = stop.flatMap { ($0["hooks"] as? [[String: Any]] ?? []) }
+            .compactMap { $0["command"] as? String }
+        XCTAssertTrue(stopCommands.contains { $0.contains("/other/tool-bridge") })
+        XCTAssertTrue(stopCommands.contains { $0.contains(installer.scriptURL.path) })
+
+        // An event we manage that the user never had is created.
+        XCTAssertNotNil(hooks["SessionEnd"])
+        // An event we don't manage is left exactly as it was.
+        let postToolUse = hooks["PostToolUse"] as? [[String: Any]] ?? []
+        XCTAssertEqual(postToolUse.count, 1)
+
+        // Unrelated settings preserved.
+        let data = try Data(contentsOf: installer.settingsURL)
+        let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        XCTAssertEqual(root?["model"] as? String, "opus")
+
+        // A backup of the pre-change file exists.
+        let backups = try FileManager.default
+            .contentsOfDirectory(atPath: installer.settingsURL.deletingLastPathComponent().path)
+            .filter { $0.hasPrefix("settings.json.workbench-backup-") }
+        XCTAssertFalse(backups.isEmpty)
+    }
+
+    func testHookInstallIsIdempotent() throws {
+        let (installer, _) = makeInstaller()
+        try installer.install()
+        let first = try readHooks(installer)
+        try installer.install()
+        let second = try readHooks(installer)
+
+        for event in WorkbenchHookInstaller.events {
+            let a = (first[event] as? [[String: Any]])?.count ?? 0
+            let b = (second[event] as? [[String: Any]])?.count ?? 0
+            XCTAssertEqual(a, b, "duplicate hook group added for \(event)")
+            XCTAssertEqual(a, 1)
+        }
+    }
+
+    func testHookUninstallRemovesOnlyOurEntries() throws {
+        let (installer, _) = makeInstaller()
+        try """
+        { "hooks": { "Stop": [ { "hooks": [ { "type": "command", "command": "/other/tool-bridge" } ] } ] } }
+        """.write(to: installer.settingsURL, atomically: true, encoding: .utf8)
+
+        try installer.install()
+        try installer.uninstall()
+
+        XCTAssertFalse(installer.isInstalled)
+        let hooks = try readHooks(installer)
+        // Foreign hook still there; our events are gone.
+        let stopCommands = (hooks["Stop"] as? [[String: Any]] ?? [])
+            .flatMap { ($0["hooks"] as? [[String: Any]] ?? []) }
+            .compactMap { $0["command"] as? String }
+        XCTAssertEqual(stopCommands, ["/other/tool-bridge"])
+        XCTAssertNil(hooks["SessionEnd"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: installer.scriptURL.path))
+    }
+
+    /// Runs the real bridge script the installer writes, to prove a hook payload
+    /// piped on stdin lands in the events directory as a complete `.json` file.
+    func testHookBridgeScriptWritesEventFile() throws {
+        let (installer, _) = makeInstaller()
+        try installer.install()
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: installer.scriptURL.path))
+
+        // The script derives its output directory from $HOME, so point HOME at a
+        // temp root and read from the same place it will write.
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wb-home-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let eventsDir = home
+            .appendingPathComponent("Library/Application Support/GhosttyClaudeWorkbench/events",
+                                   isDirectory: true)
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [installer.scriptURL.path]
+        process.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+        let stdin = Pipe()
+        process.standardInput = stdin
+        try process.run()
+        let payload = #"{"session_id":"sess-1","hook_event_name":"Stop","cwd":"/repo"}"#
+        stdin.fileHandleForWriting.write(Data(payload.utf8))
+        try stdin.fileHandleForWriting.close()
+        process.waitUntilExit()
+
+        // Never block or fail a Claude session.
+        XCTAssertEqual(process.terminationStatus, 0)
+
+        let service = WorkbenchAgentEventService(directory: eventsDir)
+        let events = service.drain()
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events.first?.sessionId, "sess-1")
+        XCTAssertEqual(events.first?.state, .idle)
+        XCTAssertEqual(events.first?.cwd, "/repo")
+
+        try? FileManager.default.removeItem(at: home)
     }
 }
