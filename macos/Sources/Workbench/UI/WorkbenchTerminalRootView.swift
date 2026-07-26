@@ -105,12 +105,20 @@ struct WorkbenchTerminalRootView<TerminalContent: View>: View {
     }
 
     private func launch(session: WorkbenchSessionRecord, fork: Bool) {
-        if !fork, session.status == .running {
+        if !fork {
+            // If Workbench already opened a window for this session, just focus it —
+            // regardless of whether the status has flipped from .launching to
+            // .running yet. Without this, a second click re-enters the resume path
+            // and hits the still-held session lock ("Session Locked").
             if surfaceRegistry.focusExisting(sessionId: session.id) {
                 return
             }
-            duplicateRunningSession = session
-            return
+            // Running elsewhere (or a window we can no longer focus): don't relaunch
+            // into the lock — offer to fork instead.
+            if session.status == .running {
+                duplicateRunningSession = session
+                return
+            }
         }
 
         launch(mode: fork

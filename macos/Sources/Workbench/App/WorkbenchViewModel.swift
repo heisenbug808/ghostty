@@ -229,9 +229,18 @@ final class WorkbenchViewModel: ObservableObject {
             }
             do {
                 if let lock = try await WorkbenchLockService(store: store).currentLock(for: sessionId) {
-                    let message = "Session \(String(sessionId.prefix(8))) is locked by launch \(String(lock.launchId.prefix(8))). Wait for it to exit, or use Fork Session instead of opening the same session twice."
-                    statusMessage = message
-                    return .blocked(LaunchBlock(title: "Session Locked", message: message))
+                    // A lock left behind by a crashed/exited launch (e.g. the process
+                    // never registered, or died immediately) must not block forever.
+                    // If it's stale, release it and fall through to re-acquire.
+                    let isRunning = sessions.first(where: { $0.id == sessionId })?.status == .running
+                    let pidAlive = lock.pid.map { FilesystemRunningStateService.isProcessAlive($0) } ?? false
+                    if lock.isStale(isRunning: isRunning, pidAlive: pidAlive, now: Date(), grace: lockLaunchGrace) {
+                        try? await WorkbenchLockService(store: store).release(sessionId: sessionId)
+                    } else {
+                        let message = "Session \(String(sessionId.prefix(8))) is locked by launch \(String(lock.launchId.prefix(8))). Wait for it to exit, or use Fork Session instead of opening the same session twice."
+                        statusMessage = message
+                        return .blocked(LaunchBlock(title: "Session Locked", message: message))
+                    }
                 }
                 _ = try await WorkbenchLockService(store: store).acquire(
                     sessionId: sessionId,
@@ -247,6 +256,31 @@ final class WorkbenchViewModel: ObservableObject {
         case .fork, .new, .continueLatest, .worktree:
             return .proceed(request)
         }
+    }
+
+    /// Ends a running session by terminating its Claude process. Unlike closing a
+    /// terminal window, this works for detached / background sessions (daemon-hosted,
+    /// Claude Desktop, `/loop` agents) because it targets the PID from the
+    /// `~/.claude/sessions` registry. Tries SIGTERM first, then SIGKILL if the
+    /// process is stubborn, releases the session lock, and refreshes.
+    func endSession(_ session: WorkbenchSessionRecord) async {
+        let running = (try? await runningState.runningSessions()) ?? [:]
+        guard let pid = running[session.id]?.pid ?? session.runningPID, pid > 0 else {
+            statusMessage = "No running process found for \(session.displayTitle)"
+            await refresh()
+            return
+        }
+
+        FilesystemRunningStateService.terminate(pid)
+        // Give it a moment to exit cleanly, then force-kill if still alive.
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        if FilesystemRunningStateService.isProcessAlive(pid) {
+            FilesystemRunningStateService.terminate(pid, force: true)
+        }
+
+        try? await WorkbenchLockService(store: store).release(sessionId: session.id)
+        statusMessage = "Ended \(session.displayTitle)"
+        await refresh()
     }
 
     func togglePinned(_ session: WorkbenchSessionRecord) {

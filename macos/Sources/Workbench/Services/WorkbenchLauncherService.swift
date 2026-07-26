@@ -25,14 +25,30 @@ struct WorkbenchBuiltLaunch: Hashable, Sendable {
 final class WorkbenchLauncherService {
     func build(_ request: WorkbenchLaunchRequest) -> WorkbenchBuiltLaunch {
         let args = claudeArguments(for: request.mode, executable: request.claudeExecutable)
-        let command = shellJoin(args)
+        let displayCommand = shellJoin(args)
         return WorkbenchBuiltLaunch(
             launchId: request.id,
-            command: command,
+            command: loginShellWrapped(displayCommand),
             workingDirectory: workingDirectory(for: request.mode),
-            displayCommand: command,
+            displayCommand: displayCommand,
             sessionId: sessionId(for: request.mode)
         )
+    }
+
+    /// Wraps the command in the user's login shell so a GUI-launched app (which
+    /// starts with launchd's minimal PATH) still resolves `claude` and friends via
+    /// the user's shell profile (`~/.zprofile`, `~/.zshrc`, …). Without this, an app
+    /// opened from the Dock/Finder fails with `claude: not found`.
+    ///
+    /// It also clears `CLAUDE_CODE_CHILD_SESSION`, which Claude Code sets in every
+    /// subprocess environment. If the Workbench app was itself launched from inside a
+    /// Claude session, that marker would otherwise be inherited by the sessions we
+    /// spawn, making them "child sessions" — which disables transcript saving and
+    /// skips the `~/.claude/sessions` registration the sidebar relies on for live
+    /// status. Workbench sessions are first-class, so we strip the marker.
+    private func loginShellWrapped(_ command: String) -> String {
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        return "\(shellQuote(shell)) -l -c \(shellQuote("unset CLAUDE_CODE_CHILD_SESSION; exec " + command))"
     }
 
     private func claudeArguments(for mode: WorkbenchLaunchMode, executable: String) -> [String] {

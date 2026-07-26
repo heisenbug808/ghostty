@@ -83,4 +83,15 @@ final class FilesystemRunningStateService: WorkbenchRunningStateReading {
         if kill(pid, 0) == 0 { return true }
         return errno == EPERM
     }
+
+    /// Ends a session's process. `SIGTERM` lets Claude Code shut down cleanly
+    /// (flush the transcript, release its daemon socket); `force` sends `SIGKILL`
+    /// as the fallback for a process that ignores `SIGTERM`. Works for detached /
+    /// background sessions too, since it targets the PID directly rather than a
+    /// terminal window.
+    @discardableResult
+    static func terminate(_ pid: Int32, force: Bool = false) -> Bool {
+        guard pid > 0 else { return false }
+        return kill(pid, force ? SIGKILL : SIGTERM) == 0
+    }
 }

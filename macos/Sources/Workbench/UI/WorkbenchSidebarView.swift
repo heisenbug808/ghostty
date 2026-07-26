@@ -11,6 +11,7 @@ struct WorkbenchSidebarView: View {
     @State private var renameText: String = ""
     @State private var worktreeDirectory: String?
     @State private var worktreeName: String = ""
+    @State private var endTarget: WorkbenchSessionRecord?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,7 +25,8 @@ struct WorkbenchSidebarView: View {
                 WorkbenchInspectorDrawer(
                     session: selected,
                     onResume: { onOpenSession(selected) },
-                    onRename: { renameText = selected.localTitle ?? ""; renameTarget = selected }
+                    onRename: { renameText = selected.localTitle ?? ""; renameTarget = selected },
+                    onEnd: { endTarget = selected }
                 )
             }
             Divider()
@@ -53,10 +55,24 @@ struct WorkbenchSidebarView: View {
             }
             Button("Cancel", role: .cancel) { worktreeDirectory = nil }
         }
+        .alert("End Session?", isPresented: endBinding, presenting: endTarget) { session in
+            Button("End Session", role: .destructive) {
+                let target = session
+                endTarget = nil
+                Task { await model.endSession(target) }
+            }
+            Button("Cancel", role: .cancel) { endTarget = nil }
+        } message: { session in
+            Text("This terminates the running Claude process for “\(session.displayTitle)”. Any unsaved work in that session is lost. Use this to clean up background sessions that have no window.")
+        }
     }
 
     private var renameBinding: Binding<Bool> {
         Binding(get: { renameTarget != nil }, set: { if !$0 { renameTarget = nil } })
+    }
+
+    private var endBinding: Binding<Bool> {
+        Binding(get: { endTarget != nil }, set: { if !$0 { endTarget = nil } })
     }
 
     private var worktreeBinding: Binding<Bool> {
@@ -195,6 +211,9 @@ struct WorkbenchSidebarView: View {
                                 .contextMenu {
                                     Button("Resume") { model.select(session); onOpenSession(session) }
                                     Button("Fork") { onForkSession(session) }
+                                    if session.status == .running {
+                                        Button("End Session…", role: .destructive) { endTarget = session }
+                                    }
                                     Divider()
                                     Button("Rename…") { renameText = session.localTitle ?? ""; renameTarget = session }
                                     Button(session.isPinned ? "Unpin" : "Pin") { model.togglePinned(session) }
@@ -295,6 +314,7 @@ private struct WorkbenchInspectorDrawer: View {
     let session: WorkbenchSessionRecord
     var onResume: () -> Void
     var onRename: () -> Void
+    var onEnd: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -321,6 +341,12 @@ private struct WorkbenchInspectorDrawer: View {
                 if let cwd = session.cwd {
                     Button("Reveal") { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: cwd) }
                         .controlSize(.small)
+                }
+                if session.status == .running {
+                    Button("End", role: .destructive, action: onEnd)
+                        .controlSize(.small)
+                        .tint(.red)
+                        .help("Terminate this session's Claude process")
                 }
             }
             .padding(.top, 2)

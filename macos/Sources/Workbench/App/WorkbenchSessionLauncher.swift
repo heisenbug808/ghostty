@@ -15,8 +15,10 @@ enum WorkbenchSessionLauncher {
         ghostty: Ghostty.App,
         from parent: NSWindow?
     ) async {
-        if session.status == .running,
-           WorkbenchSurfaceRegistry.shared.focusExisting(sessionId: session.id) {
+        // Focus an already-open Workbench window for this session if we have one,
+        // regardless of status (.launching or .running) — avoids relaunching into
+        // the session lock on a repeat open.
+        if WorkbenchSurfaceRegistry.shared.focusExisting(sessionId: session.id) {
             return
         }
 
