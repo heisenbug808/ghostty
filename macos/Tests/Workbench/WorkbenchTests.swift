@@ -637,6 +637,99 @@ final class WorkbenchTests: XCTestCase {
         XCTAssertFalse(session.needsReview)
     }
 
+    // MARK: - Transcript reader
+
+    /// Shapes taken from a real transcript: plain-string user turns, assistant
+    /// text/thinking/tool_use blocks, tool_result echoes on the user side, images,
+    /// and the bookkeeping entry types that share the file.
+    func testTranscriptParsesConversationAndSkipsNoise() {
+        let jsonl = """
+        {"type":"mode","mode":"auto"}
+        {"type":"user","timestamp":"2026-07-22T10:00:00.000Z","message":{"role":"user","content":"fix the bug"}}
+        {"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"internal reasoning"},{"type":"text","text":"On it."},{"type":"tool_use","name":"Bash","input":{"command":"go test ./...","description":"run tests"}}]}}
+        {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":[{"type":"text","text":"ok"}]}]}}
+        {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Tests pass."}]}}
+        {"type":"file-history-snapshot","snapshot":{}}
+        {"type":"user","isSidechain":true,"message":{"role":"user","content":"subagent prompt"}}
+        {"type":"user","isMeta":true,"message":{"role":"user","content":"injected meta"}}
+        {"type":"user","message":{"role":"user","content":[{"type":"image","source":{}},{"type":"text","text":"see screenshot"}]}}
+        """
+
+        let messages = WorkbenchTranscriptService.parse(jsonl: jsonl)
+        let rendered = messages.map { "\($0.kind)|\($0.toolName ?? "-")|\($0.text)" }
+        XCTAssertEqual(rendered, [
+            "user|-|fix the bug",
+            "assistant|-|On it.",
+            "tool|Bash|go test ./...",
+            "assistant|-|Tests pass.",
+            "user|-|[image]",
+            "user|-|see screenshot",
+        ])
+
+        // Thinking, tool_result payloads, bookkeeping rows, subagent sidechains and
+        // injected meta messages are all absent.
+        XCTAssertFalse(rendered.contains { $0.contains("internal reasoning") })
+        XCTAssertFalse(rendered.contains { $0.contains("ok") })
+        XCTAssertFalse(rendered.contains { $0.contains("subagent") })
+        XCTAssertFalse(rendered.contains { $0.contains("injected") })
+
+        // Timestamps with fractional seconds parse.
+        XCTAssertNotNil(messages.first?.timestamp)
+        // Ids are contiguous for stable SwiftUI identity.
+        XCTAssertEqual(messages.map(\.id), Array(0..<messages.count))
+    }
+
+    func testTranscriptKeepsOnlyTheTailAndPrefersUsefulToolArgument() {
+        let lines = (0..<50).map { index in
+            #"{"type":"user","message":{"role":"user","content":"message \#(index)"}}"#
+        }.joined(separator: "\n")
+
+        let messages = WorkbenchTranscriptService.parse(jsonl: lines, limit: 10)
+        XCTAssertEqual(messages.count, 10)
+        // The *last* 10, renumbered from zero.
+        XCTAssertEqual(messages.first?.text, "message 40")
+        XCTAssertEqual(messages.last?.text, "message 49")
+        XCTAssertEqual(messages.first?.id, 0)
+
+        // file_path wins over other string values for an edit-shaped tool call.
+        let edit = WorkbenchTranscriptService.parse(jsonl: #"""
+        {"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"old_string":"a","file_path":"/repo/main.go","new_string":"b"}}]}}
+        """#)
+        XCTAssertEqual(edit.first?.toolName, "Edit")
+        XCTAssertEqual(edit.first?.text, "/repo/main.go")
+
+        // Newlines are collapsed and long arguments truncated so a tool line stays
+        // one line.
+        let long = WorkbenchTranscriptService.parse(jsonl: #"""
+        {"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"line one\nline two \#(String(repeating: "x", count: 200))"}}]}}
+        """#)
+        XCTAssertFalse(long.first?.text.contains("\n") ?? true)
+        XCTAssertTrue(long.first?.text.hasSuffix("…") ?? false)
+        XCTAssertLessThanOrEqual(long.first?.text.count ?? 999, 121)
+    }
+
+    func testTranscriptMissingFileIsEmptyAndCacheHonorsPath() {
+        let service = WorkbenchTranscriptService()
+        XCTAssertTrue(service.messages(atPath: "/nope/missing.jsonl").isEmpty)
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wb-tx-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let a = dir.appendingPathComponent("a.jsonl")
+        let b = dir.appendingPathComponent("b.jsonl")
+        try? #"{"type":"user","message":{"role":"user","content":"from A"}}"#
+            .write(to: a, atomically: true, encoding: .utf8)
+        try? #"{"type":"user","message":{"role":"user","content":"from B"}}"#
+            .write(to: b, atomically: true, encoding: .utf8)
+
+        XCTAssertEqual(service.messages(atPath: a.path).first?.text, "from A")
+        // A different path must not return the cached result for the previous one.
+        XCTAssertEqual(service.messages(atPath: b.path).first?.text, "from B")
+        XCTAssertEqual(service.messages(atPath: a.path).first?.text, "from A")
+
+        try? FileManager.default.removeItem(at: dir)
+    }
+
     // MARK: - Hook installer
 
     private func makeInstaller() -> (WorkbenchHookInstaller, URL) {

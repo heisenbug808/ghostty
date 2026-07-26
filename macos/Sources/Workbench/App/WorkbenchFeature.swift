@@ -8,6 +8,7 @@ enum WorkbenchFeature {
     static let enabledKey = "Workbench.Enabled"
     static let sidebarVisibleKey = "Workbench.SidebarVisible"
     static let sidebarWidthKey = "Workbench.SidebarWidth"
+    static let detailsVisibleKey = "Workbench.DetailsVisible"
 
     static var isEnabled: Bool {
         UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
@@ -16,6 +17,13 @@ enum WorkbenchFeature {
     static var isSidebarVisible: Bool {
         get { UserDefaults.standard.object(forKey: sidebarVisibleKey) as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: sidebarVisibleKey) }
+    }
+
+    /// Off by default: the details panel is opt-in so a first launch still looks
+    /// like a terminal with a session list, not a three-column IDE.
+    static var isDetailsVisible: Bool {
+        get { UserDefaults.standard.object(forKey: detailsVisibleKey) as? Bool ?? false }
+        set { UserDefaults.standard.set(newValue, forKey: detailsVisibleKey) }
     }
 
     static var sidebarWidth: Double {

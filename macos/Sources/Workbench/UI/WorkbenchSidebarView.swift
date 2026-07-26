@@ -20,15 +20,6 @@ struct WorkbenchSidebarView: View {
             filterBar
             Divider()
             sessionList
-            if let selected = model.selectedSession {
-                Divider()
-                WorkbenchInspectorDrawer(
-                    session: selected,
-                    onResume: { onOpenSession(selected) },
-                    onRename: { renameText = selected.localTitle ?? ""; renameTarget = selected },
-                    onEnd: { endTarget = selected }
-                )
-            }
             Divider()
             footer
         }
@@ -90,12 +81,13 @@ struct WorkbenchSidebarView: View {
     }
 
     private var header: some View {
-        HStack {
+        HStack(spacing: 6) {
             Image(systemName: "sparkles")
+                .font(.system(size: 11))
                 .foregroundStyle(.purple)
             Text("Claude Workbench")
-                .font(.headline)
-            Spacer()
+                .font(.system(size: 12.5, weight: .semibold))
+            Spacer(minLength: 2)
             Menu {
                 Button("New Session…") {
                     if let dir = chooseDirectory() { onLaunch(.new(projectPath: dir, prompt: nil)) }
@@ -113,23 +105,25 @@ struct WorkbenchSidebarView: View {
             .fixedSize()
             .help("New Claude session")
             Button {
+                model.toggleDetails()
+            } label: {
+                Image(systemName: "sidebar.right")
+                    .foregroundStyle(model.isDetailsVisible ? Color.accentColor : Color.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help(model.isDetailsVisible ? "Hide details panel" : "Show details panel")
+            Button {
                 model.toggleSidebar()
             } label: {
                 Image(systemName: "sidebar.left")
             }
             .buttonStyle(.borderless)
             .help("Hide Claude Workbench sidebar")
-            Button {
-                Task { await model.refresh() }
-            } label: {
-                Image(systemName: "arrow.clockwise")
-            }
-            .buttonStyle(.borderless)
-            .help("Refresh Claude sessions")
             settingsMenu
         }
+        .font(.system(size: 12))
         .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.vertical, 9)
     }
 
     /// Agent-status hook + notification preferences. The hook is what lets sessions
@@ -154,6 +148,10 @@ struct WorkbenchSidebarView: View {
                     get: { WorkbenchNotifier.notifyOnAwaitingInput },
                     set: { WorkbenchNotifier.notifyOnAwaitingInput = $0 }))
             }
+            Divider()
+            // Rarely needed now that FSEvents drives updates, so it lives here
+            // instead of spending a slot in the header.
+            Button("Refresh Sessions") { Task { await model.refresh() } }
         } label: {
             Image(systemName: "gearshape")
         }
@@ -168,6 +166,7 @@ struct WorkbenchSidebarView: View {
                 .foregroundStyle(.secondary)
             TextField("Search sessions  ·  ⏎ opens best match", text: $model.searchText)
                 .textFieldStyle(.plain)
+                .font(.system(size: 12))
                 .onSubmit {
                     if let top = model.topSearchMatch {
                         model.select(top)
@@ -235,9 +234,15 @@ struct WorkbenchSidebarView: View {
                                 )
                                 .id(session.id)
                                 .contentShape(Rectangle())
-                                .onTapGesture {
+                                // Double-click opens; a single click only selects, so
+                                // you can inspect a session in the details panel
+                                // without launching a Claude process for it.
+                                .onTapGesture(count: 2) {
                                     model.select(session)
                                     onOpenSession(session)
+                                }
+                                .onTapGesture {
+                                    model.select(session)
                                 }
                                 .contextMenu {
                                     Button("Resume") { model.select(session); onOpenSession(session) }
@@ -327,76 +332,17 @@ struct WorkbenchSidebarView: View {
     }
 
     private var footer: some View {
-        HStack {
+        HStack(spacing: 4) {
             Text(model.statusMessage ?? "Workbench ready")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .font(.system(size: 10.5))
+                .foregroundStyle(.tertiary)
                 .lineLimit(2)
-            Spacer()
+            Spacer(minLength: 0)
         }
-        .padding(10)
-    }
-
-}
-
-/// Compact details panel for the selected/focused session, shown at the bottom
-/// of the sidebar (mounts the inspector into the actual layout).
-private struct WorkbenchInspectorDrawer: View {
-    let session: WorkbenchSessionRecord
-    var onResume: () -> Void
-    var onRename: () -> Void
-    var onEnd: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 6) {
-                Circle().fill(statusColor).frame(width: 7, height: 7)
-                Text(session.displayTitle).font(.subheadline.weight(.semibold)).lineLimit(1)
-                Spacer(minLength: 4)
-                if session.needsReview {
-                    Image(systemName: "exclamationmark.bubble").font(.caption2).foregroundStyle(.orange)
-                        .help("Claude is waiting on you")
-                }
-            }
-            HStack(spacing: 10) {
-                Text(session.status.rawValue).font(.caption2).foregroundStyle(.secondary)
-                if let count = session.messageCount { Text("\(count) msgs").font(.caption2).foregroundStyle(.secondary) }
-                if let exit = session.lastExitCode { Text("exit \(exit)").font(.caption2).foregroundStyle(exit == 0 ? Color.secondary : Color.red) }
-            }
-            if let cwd = session.cwd {
-                Text(cwd).font(.caption2).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-            }
-            HStack(spacing: 12) {
-                Button("Resume", action: onResume).controlSize(.small)
-                Button("Rename", action: onRename).controlSize(.small)
-                if let cwd = session.cwd {
-                    Button("Reveal") { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: cwd) }
-                        .controlSize(.small)
-                }
-                if session.status == .running {
-                    Button("End", role: .destructive, action: onEnd)
-                        .controlSize(.small)
-                        .tint(.red)
-                        .help("Terminate this session's Claude process")
-                }
-            }
-            .padding(.top, 2)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.vertical, 7)
     }
 
-    private var statusColor: Color {
-        switch session.status {
-        case .running: return .green
-        case .launching: return .yellow
-        case .failed: return .red
-        case .archived: return .secondary
-        case .unknown: return .orange
-        case .indexed, .idle: return .gray
-        }
-    }
 }
 
 private struct WorkbenchWorktreeHeader: View {
@@ -417,29 +363,37 @@ private struct WorkbenchWorktreeHeader: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 Text(group.repoName)
-                    .fontWeight(.semibold)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .truncationMode(.middle)
                 if let branch = group.branch {
+                    // A pill keeps the branch from reading as part of the repo name.
                     Text(branch)
-                        .font(.caption2)
+                        .font(.system(size: 9.5, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(RoundedRectangle(cornerRadius: 3).fill(Color.primary.opacity(0.07)))
                 }
                 if let dirty = group.dirty, dirty > 0 {
                     Text("±\(dirty)")
-                        .font(.caption2)
+                        .font(.system(size: 9.5, weight: .medium))
                         .foregroundStyle(.orange)
                 }
                 Spacer(minLength: 4)
                 // Running count stays visible even when the group is collapsed.
                 if group.runningCount > 0 {
                     Text("\(group.runningCount)")
-                        .font(.caption2)
+                        .font(.system(size: 9.5, weight: .medium))
+                        .monospacedDigit()
                         .foregroundStyle(.green)
-                    Circle().fill(.green).frame(width: 6, height: 6)
+                    Circle().fill(.green).frame(width: 5, height: 5)
                 }
             }
+            .padding(.vertical, 3)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -469,13 +423,13 @@ private struct WorkbenchSessionRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Circle()
-                .fill(statusColor)
-                .frame(width: 8, height: 8)
-            VStack(alignment: .leading, spacing: 2) {
+            WorkbenchStatusDot(session: session)
+            VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 4) {
                     Text(session.displayTitle)
+                        .font(.system(size: 12.5, weight: isSelected ? .medium : .regular))
                         .lineLimit(1)
+                        .truncationMode(.tail)
                     if session.isPinned {
                         Image(systemName: "pin.fill")
                             .font(.caption2)
@@ -517,18 +471,34 @@ private struct WorkbenchSessionRow: View {
                     }
                     .frame(minWidth: 40, alignment: .trailing)
                 }
-                Text(subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                // Only when it says something the group header doesn't already.
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
             }
         }
-        .padding(.vertical, 4)
-        .padding(.horizontal, 6)
+        .padding(.vertical, 5)
+        .padding(.leading, 8)
+        .padding(.trailing, 6)
         .background(
             RoundedRectangle(cornerRadius: 6)
-                .fill(isSelected ? Color.accentColor.opacity(0.20) : Color.clear)
+                .fill(isSelected
+                      ? Color.accentColor.opacity(0.16)
+                      : (hovering ? Color.primary.opacity(0.055) : Color.clear))
         )
+        // A leading accent bar makes the selected row readable at a glance even
+        // against the terminal's own background tint.
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 1)
+                .fill(Color.accentColor)
+                .frame(width: 2.5)
+                .padding(.vertical, 3)
+                .opacity(isSelected ? 1 : 0)
+        }
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
     }
@@ -562,29 +532,21 @@ private struct WorkbenchSessionRow: View {
         return "\(Int(seconds / 86400))d"
     }
 
-    private var subtitle: String {
+    /// Second line, or nil when there's nothing to add. A session sitting at the
+    /// group's own root has no extra location to show — it used to render a bare
+    /// "·" on every such row, which was just noise.
+    private var subtitle: String? {
         if let cwd = session.cwd {
-            // Show the path relative to the worktree root; the section header
-            // already carries the repo, so a bare subdir is enough here.
-            if !worktreePath.isEmpty, cwd == worktreePath { return "·" }
+            if !worktreePath.isEmpty, cwd == worktreePath { return nil }
             if !worktreePath.isEmpty, cwd.hasPrefix(worktreePath + "/") {
                 return String(cwd.dropFirst(worktreePath.count + 1))
             }
             return (cwd as NSString).lastPathComponent
         }
-        if let lastModifiedAt = session.lastModifiedAt { return lastModifiedAt.formatted(date: .abbreviated, time: .shortened) }
-        return session.id
-    }
-
-    private var statusColor: Color {
-        switch session.status {
-        case .running: return .green
-        case .launching: return .yellow
-        case .failed: return .red
-        case .archived: return .secondary
-        case .unknown: return .orange
-        case .indexed, .idle: return .gray
+        if let lastModifiedAt = session.lastModifiedAt {
+            return lastModifiedAt.formatted(date: .abbreviated, time: .shortened)
         }
+        return String(session.id.prefix(12))
     }
 }
 

@@ -15,6 +15,7 @@ struct WorkbenchTerminalRootView<TerminalContent: View>: View {
     // Persisted sidebar width, shared across all windows via UserDefaults so a drag
     // in one window resizes them all and survives relaunch.
     @AppStorage("workbench.sidebarWidth") private var sidebarWidth: Double = 280
+    @AppStorage("workbench.detailsWidth") private var detailsWidth: Double = 320
     // The app-wide registry — the SAME instance TerminalController.windowDidBecomeKey
     // reads, so registering here actually drives the focus-follows highlight.
     private var surfaceRegistry: WorkbenchSurfaceRegistry { .shared }
@@ -49,6 +50,35 @@ struct WorkbenchTerminalRootView<TerminalContent: View>: View {
                             maxWidth: workbenchMaxSidebarWidth
                         )
                         terminalContent
+                        if model.isDetailsVisible {
+                            // Dragging this handle leftward widens the panel, so the
+                            // translation is inverted relative to the sidebar's.
+                            WorkbenchResizeHandle(
+                                width: $detailsWidth,
+                                minWidth: workbenchMinDetailsWidth,
+                                maxWidth: workbenchMaxDetailsWidth,
+                                inverted: true
+                            )
+                            Group {
+                                if let selected = model.selectedSession {
+                                    WorkbenchDetailsPanel(
+                                        model: model,
+                                        session: selected,
+                                        onResume: { launch(session: selected, fork: false) },
+                                        onFork: { launch(session: selected, fork: true) }
+                                    )
+                                } else {
+                                    // Keep the panel in place rather than collapsing the
+                                    // layout every time selection clears.
+                                    WorkbenchPanelPlaceholder(
+                                        icon: "sidebar.right",
+                                        title: "No session selected",
+                                        message: "Click a session to see its details, transcript, and git state.")
+                                    .background(Color(nsColor: .controlBackgroundColor))
+                                }
+                            }
+                            .frame(width: detailsWidth)
+                        }
                     }
                 } else {
                     // Sidebar hidden: keep an always-available affordance to reveal it
@@ -161,6 +191,8 @@ struct WorkbenchTerminalRootView<TerminalContent: View>: View {
 
 private let workbenchMinSidebarWidth: Double = 220
 private let workbenchMaxSidebarWidth: Double = 480
+private let workbenchMinDetailsWidth: Double = 260
+private let workbenchMaxDetailsWidth: Double = 560
 
 /// A 1pt divider with a wider invisible hit area that drags to resize the sidebar,
 /// showing the horizontal-resize cursor on hover — like a Ghostty split divider.
@@ -168,6 +200,8 @@ private struct WorkbenchResizeHandle: View {
     @Binding var width: Double
     let minWidth: Double
     let maxWidth: Double
+    /// True for a panel on the *right*, where dragging left must grow it.
+    var inverted = false
     // The width when the current drag began, so translation is applied to a stable base.
     @State private var dragStartWidth: Double?
 
@@ -189,7 +223,8 @@ private struct WorkbenchResizeHandle: View {
                             .onChanged { value in
                                 let base = dragStartWidth ?? width
                                 if dragStartWidth == nil { dragStartWidth = base }
-                                width = min(max(base + value.translation.width, minWidth), maxWidth)
+                                let delta = inverted ? -value.translation.width : value.translation.width
+                                width = min(max(base + delta, minWidth), maxWidth)
                             }
                             .onEnded { _ in dragStartWidth = nil }
                     )

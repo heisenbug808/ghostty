@@ -52,6 +52,15 @@ final class WorkbenchViewModel: ObservableObject {
             WorkbenchFeature.isSidebarVisible = isSidebarVisible
         }
     }
+    /// Right-hand details panel visibility, persisted like the sidebar's.
+    @Published var isDetailsVisible: Bool = WorkbenchFeature.isDetailsVisible {
+        didSet {
+            guard oldValue != isDetailsVisible else { return }
+            WorkbenchFeature.isDetailsVisible = isDetailsVisible
+        }
+    }
+    /// Selected details tab. Shared so it survives switching between sessions.
+    @Published var detailsTab: WorkbenchDetailsPanel.Tab = .info
 
     private let store: WorkbenchStore
     private let indexer: WorkbenchSessionIndexing
@@ -59,6 +68,7 @@ final class WorkbenchViewModel: ObservableObject {
     private let gitService: WorkbenchGitReading
     private let collapseStore: WorkbenchGroupCollapseStore
     private let agentEvents: WorkbenchAgentEventService
+    private let transcriptService = WorkbenchTranscriptService()
     private var fileWatcher: WorkbenchFileWatcher?
     private var isRefreshing = false
     private var refreshQueued = false
@@ -417,6 +427,22 @@ final class WorkbenchViewModel: ObservableObject {
                 state: state,
                 cwd: session?.cwd ?? event.cwd)
         }
+    }
+
+    // MARK: - Details panel data
+
+    func toggleDetails() { isDetailsVisible.toggle() }
+
+    /// Git facts for a session's working directory, from the current refresh.
+    func gitInfo(for session: WorkbenchSessionRecord) -> WorkbenchGitInfo? {
+        session.cwd.flatMap { gitInfoByCwd[$0] }
+    }
+
+    /// Readable transcript tail for a session. Cached by path+mtime inside the
+    /// service, so re-rendering the panel doesn't re-read the file.
+    func transcript(for session: WorkbenchSessionRecord) -> [WorkbenchTranscriptMessage] {
+        guard let path = session.transcriptPath else { return [] }
+        return transcriptService.messages(atPath: path)
     }
 
     // MARK: - Hook integration
