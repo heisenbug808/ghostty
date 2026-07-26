@@ -6,6 +6,7 @@ import GhosttyKit
 struct WorkbenchTerminalRootView<TerminalContent: View>: View {
     @ObservedObject var model: WorkbenchViewModel
     let ghostty: Ghostty.App
+    @ObservedObject private var ghosttyConfig: Ghostty.Config
     let parentWindowProvider: () -> NSWindow?
     let terminalContent: TerminalContent
     @State private var duplicateRunningSession: WorkbenchSessionRecord?
@@ -28,9 +29,14 @@ struct WorkbenchTerminalRootView<TerminalContent: View>: View {
     ) {
         self.model = model
         self.ghostty = ghostty
+        self.ghosttyConfig = ghostty.config
         self.parentWindowProvider = parentWindowProvider
         self.terminalContent = terminalContent()
     }
+
+    /// Chrome colors follow the terminal's own theme. `ghosttyConfig` is observed
+    /// so a live config reload (or theme switch) repaints the sidebar with it.
+    private var theme: WorkbenchTheme { WorkbenchTheme(config: ghosttyConfig) }
 
     var body: some View {
         Group {
@@ -74,7 +80,7 @@ struct WorkbenchTerminalRootView<TerminalContent: View>: View {
                                         icon: "sidebar.right",
                                         title: "No session selected",
                                         message: "Click a session to see its details, transcript, and git state.")
-                                    .background(Color(nsColor: .controlBackgroundColor))
+                                    .background(WorkbenchChromeBackground())
                                 }
                             }
                             .frame(width: detailsWidth)
@@ -101,6 +107,7 @@ struct WorkbenchTerminalRootView<TerminalContent: View>: View {
                 terminalContent
             }
         }
+        .environment(\.workbenchTheme, theme)
         .alert(
             "Session Already Running",
             isPresented: duplicateRunningAlertBinding,

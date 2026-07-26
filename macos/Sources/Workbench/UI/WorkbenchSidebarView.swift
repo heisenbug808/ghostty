@@ -12,6 +12,7 @@ struct WorkbenchSidebarView: View {
     @State private var worktreeDirectory: String?
     @State private var worktreeName: String = ""
     @State private var endTarget: WorkbenchSessionRecord?
+    @Environment(\.workbenchTheme) private var theme
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,7 +25,8 @@ struct WorkbenchSidebarView: View {
             footer
         }
         .frame(maxWidth: .infinity)
-        .background(Color(nsColor: .controlBackgroundColor))
+        .background(WorkbenchChromeBackground())
+        .foregroundStyle(theme.primary)
         .alert("Rename Session", isPresented: renameBinding) {
             TextField("Display name", text: $renameText)
             Button("Save") {
@@ -108,7 +110,7 @@ struct WorkbenchSidebarView: View {
                 model.toggleDetails()
             } label: {
                 Image(systemName: "sidebar.right")
-                    .foregroundStyle(model.isDetailsVisible ? Color.accentColor : Color.secondary)
+                    .foregroundStyle(model.isDetailsVisible ? Color.accentColor : theme.secondary)
             }
             .buttonStyle(.borderless)
             .help(model.isDetailsVisible ? "Hide details panel" : "Show details panel")
@@ -163,7 +165,7 @@ struct WorkbenchSidebarView: View {
     private var search: some View {
         HStack {
             Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(theme.secondary)
             TextField("Search sessions  ·  ⏎ opens best match", text: $model.searchText)
                 .textFieldStyle(.plain)
                 .font(.system(size: 12))
@@ -175,7 +177,7 @@ struct WorkbenchSidebarView: View {
                 }
         }
         .padding(7)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .textBackgroundColor)))
+        .background(RoundedRectangle(cornerRadius: 7).fill(theme.elevatedFill))
         .padding(.horizontal, 10)
         .padding(.bottom, 8)
     }
@@ -195,12 +197,12 @@ struct WorkbenchSidebarView: View {
                             Text("\(count)").font(.caption2).monospacedDigit()
                         }
                     }
-                    .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+                    .foregroundStyle(selected ? Color.accentColor : theme.secondary)
                     .padding(.horizontal, 7)
                     .padding(.vertical, 3)
                     .background(
                         RoundedRectangle(cornerRadius: 6)
-                            .fill(selected ? Color.accentColor.opacity(0.18) : Color.clear)
+                            .fill(selected ? theme.selectionFill : Color.clear)
                     )
                     .contentShape(Rectangle())
                 }
@@ -304,11 +306,11 @@ struct WorkbenchSidebarView: View {
         VStack(spacing: 8) {
             Image(systemName: emptyIcon)
                 .font(.system(size: 26))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(theme.secondary)
             Text(emptyTitle).font(.callout.weight(.medium))
             Text(emptySubtitle)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(theme.secondary)
                 .multilineTextAlignment(.center)
         }
         .padding(24)
@@ -335,7 +337,7 @@ struct WorkbenchSidebarView: View {
         HStack(spacing: 4) {
             Text(model.statusMessage ?? "Workbench ready")
                 .font(.system(size: 10.5))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(theme.tertiary)
                 .lineLimit(2)
             Spacer(minLength: 0)
         }
@@ -346,6 +348,7 @@ struct WorkbenchSidebarView: View {
 }
 
 private struct WorkbenchWorktreeHeader: View {
+    @Environment(\.workbenchTheme) private var theme
     let group: WorkbenchWorktreeGroup
     let isCollapsed: Bool
     let onToggle: () -> Void
@@ -356,27 +359,27 @@ private struct WorkbenchWorktreeHeader: View {
             HStack(spacing: 6) {
                 Image(systemName: "chevron.right")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondary)
                     .rotationEffect(.degrees(isCollapsed ? 0 : 90))
                     .animation(.easeInOut(duration: 0.15), value: isCollapsed)
                 Image(systemName: icon)
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondary)
                 Text(group.repoName)
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 if let branch = group.branch {
                     // A pill keeps the branch from reading as part of the repo name.
                     Text(branch)
                         .font(.system(size: 9.5, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(theme.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .padding(.horizontal, 4)
                         .padding(.vertical, 1)
-                        .background(RoundedRectangle(cornerRadius: 3).fill(Color.primary.opacity(0.07)))
+                        .background(RoundedRectangle(cornerRadius: 3).fill(theme.elevatedFill))
                 }
                 if let dirty = group.dirty, dirty > 0 {
                     Text("±\(dirty)")
@@ -414,6 +417,7 @@ private struct WorkbenchWorktreeHeader: View {
 }
 
 private struct WorkbenchSessionRow: View {
+    @Environment(\.workbenchTheme) private var theme
     let session: WorkbenchSessionRecord
     var worktreePath: String = ""
     var isSelected: Bool = false
@@ -448,7 +452,7 @@ private struct WorkbenchSessionRow: View {
                         if let relative = relativeTime {
                             Text(relative)
                                 .font(.caption2)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(theme.secondary)
                                 .monospacedDigit()
                                 .opacity(hovering ? 0 : 1)
                         }
@@ -466,7 +470,7 @@ private struct WorkbenchSessionRow: View {
                                 .help(session.isArchived ? "Unarchive" : "Archive")
                             }
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(theme.secondary)
                         }
                     }
                     .frame(minWidth: 40, alignment: .trailing)
@@ -475,7 +479,7 @@ private struct WorkbenchSessionRow: View {
                 if let subtitle {
                     Text(subtitle)
                         .font(.system(size: 10.5))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(theme.tertiary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
@@ -487,8 +491,8 @@ private struct WorkbenchSessionRow: View {
         .background(
             RoundedRectangle(cornerRadius: 6)
                 .fill(isSelected
-                      ? Color.accentColor.opacity(0.16)
-                      : (hovering ? Color.primary.opacity(0.055) : Color.clear))
+                      ? theme.selectionFill
+                      : (hovering ? theme.hoverFill : Color.clear))
         )
         // A leading accent bar makes the selected row readable at a glance even
         // against the terminal's own background tint.

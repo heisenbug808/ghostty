@@ -23,6 +23,7 @@ struct WorkbenchDetailsPanel: View {
     var onResume: () -> Void
     var onFork: () -> Void
 
+    @Environment(\.workbenchTheme) private var theme
     @State private var renameText = ""
     @State private var isRenaming = false
     @State private var isConfirmingEnd = false
@@ -51,7 +52,8 @@ struct WorkbenchDetailsPanel: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .background(Color(nsColor: .controlBackgroundColor))
+        .background(WorkbenchChromeBackground())
+        .foregroundStyle(theme.primary)
         .alert("Rename Session", isPresented: $isRenaming) {
             TextField("Display name", text: $renameText)
             Button("Save") { model.rename(session, to: renameText) }
