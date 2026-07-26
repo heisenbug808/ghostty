@@ -11,7 +11,7 @@ import UserNotifications
 /// our notifications with `workbenchSessionId` in `userInfo`, and AppDelegate hands
 /// those back to us via `isWorkbenchNotification` / `handle(response:)`.
 @MainActor
-final class WorkbenchNotifier {
+final class WorkbenchNotifier: ObservableObject {
     static let shared = WorkbenchNotifier()
 
     static let notifyOnCompleteKey = "Workbench.NotifyOnComplete"
@@ -34,10 +34,53 @@ final class WorkbenchNotifier {
 
     private var didRequestAuthorization = false
 
+    /// Whether the system will actually show what we post. Notifications failing
+    /// silently — denied permission, or Do Not Disturb — is indistinguishable from
+    /// a broken pipeline from the user's side, so the settings menu reports it.
+    @Published private(set) var permission: Permission = .unknown
+
+    enum Permission {
+        case unknown
+        case allowed
+        case denied
+        case notRequested
+
+        var summary: String? {
+            switch self {
+            case .allowed, .unknown: return nil
+            case .denied: return "Notifications are turned off for Workbench in System Settings"
+            case .notRequested: return "Notifications not enabled yet"
+            }
+        }
+    }
+
     func requestAuthorizationIfNeeded() {
         guard !didRequestAuthorization else { return }
         didRequestAuthorization = true
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in
+            Task { @MainActor in self.refreshPermission() }
+        }
+    }
+
+    /// Reads the current authorization so the UI can say why nothing is appearing.
+    func refreshPermission() {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            let permission: Permission
+            switch settings.authorizationStatus {
+            case .authorized, .provisional, .ephemeral: permission = .allowed
+            case .denied: permission = .denied
+            case .notDetermined: permission = .notRequested
+            @unknown default: permission = .unknown
+            }
+            Task { @MainActor in self.permission = permission }
+        }
+    }
+
+    /// Opens the pane where the user can turn notifications back on.
+    func openSystemSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.notifications")
+        else { return }
+        NSWorkspace.shared.open(url)
     }
 
     /// Notifies for a state transition. `title` is the session's display title.

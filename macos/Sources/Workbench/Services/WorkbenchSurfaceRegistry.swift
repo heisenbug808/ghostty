@@ -48,6 +48,17 @@ final class WorkbenchSurfaceRegistry: ObservableObject {
         return nil
     }
 
+    /// Whether Workbench has a live window for this session.
+    ///
+    /// A session can be running without one — started from Claude Desktop, another
+    /// terminal, or a daemon-hosted background agent. Those can't be focused or
+    /// resumed (a second process would fight over the same transcript), so the UI
+    /// offers different actions for them.
+    func hasWindow(sessionId: String) -> Bool {
+        cleanupStaleEntries()
+        return entriesBySession[sessionId]?.window != nil
+    }
+
     func focusExisting(sessionId: String) -> Bool {
         cleanupStaleEntries()
         guard let window = entriesBySession[sessionId]?.window else { return false }

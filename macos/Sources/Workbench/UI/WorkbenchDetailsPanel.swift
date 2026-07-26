@@ -128,11 +128,17 @@ struct WorkbenchDetailsPanel: View {
     private var actions: some View {
         // Wraps on a narrow panel instead of clipping.
         HStack(spacing: 6) {
-            WorkbenchActionButton(
-                icon: session.status == .running ? "arrow.up.forward.app" : "play.fill",
-                title: session.status == .running ? "Open" : "Resume",
-                action: onResume)
-            WorkbenchActionButton(icon: "arrow.triangle.branch", title: "Fork", action: onFork)
+            // A session running outside Workbench can't be focused or resumed —
+            // forking is the only way to pick up where it is.
+            if model.isRunningElsewhere(session) {
+                WorkbenchActionButton(icon: "arrow.triangle.branch", title: "Fork", action: onFork)
+            } else {
+                WorkbenchActionButton(
+                    icon: session.status == .running ? "arrow.up.forward.app" : "play.fill",
+                    title: session.status == .running ? "Open" : "Resume",
+                    action: onResume)
+                WorkbenchActionButton(icon: "arrow.triangle.branch", title: "Fork", action: onFork)
+            }
             Menu {
                 Button("Rename…") {
                     renameText = session.localTitle ?? ""
@@ -177,6 +183,7 @@ struct WorkbenchDetailsPanel: View {
             case .ended: return "Ended"
             }
         }
+        if model.isRunningElsewhere(session) { return "Running outside Workbench" }
         return session.status.rawValue.capitalized
     }
 

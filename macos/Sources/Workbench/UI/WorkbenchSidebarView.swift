@@ -17,6 +17,8 @@ struct WorkbenchSidebarView: View {
     // list re-renders the moment the menu changes it.
     @State private var density: WorkbenchDensity = WorkbenchFeature.density
     @Environment(\.workbenchTheme) private var theme
+    @FocusState private var searchFocused: Bool
+    @ObservedObject private var notifier = WorkbenchNotifier.shared
 
     var body: some View {
         VStack(spacing: 0) {
@@ -32,6 +34,7 @@ struct WorkbenchSidebarView: View {
         .background(WorkbenchChromeBackground())
         .foregroundStyle(theme.primary)
         .onChange(of: density) { newValue in WorkbenchFeature.density = newValue }
+        .onAppear { notifier.refreshPermission() }
         .alert("Rename Session", isPresented: renameBinding) {
             TextField("Display name", text: $renameText)
             Button("Save") {
@@ -68,6 +71,38 @@ struct WorkbenchSidebarView: View {
             Button("Cancel", role: .cancel) { endTarget = nil }
         } message: { session in
             Text("This terminates the running Claude process for “\(session.displayTitle)”. Any unsaved work in that session is lost. Use this to clean up background sessions that have no window.")
+        }
+    }
+
+    /// Opens whatever the keyboard is pointing at: the highlighted row, or the
+    /// best search match when the user hasn't arrowed anywhere yet.
+    private func openHighlighted() {
+        let target = model.selectedSession ?? model.topSearchMatch
+        guard let target else { return }
+        model.select(target)
+        onOpenSession(target)
+    }
+
+    private func handleKey(_ key: WorkbenchKey) -> Bool {
+        switch key {
+        case .down:
+            model.moveSelection(by: 1)
+            return true
+        case .up:
+            model.moveSelection(by: -1)
+            return true
+        case .enter:
+            openHighlighted()
+            return true
+        case .escape:
+            // First press clears the query, a second gives focus back to the
+            // terminal — Escape shouldn't strand you in the sidebar.
+            if model.searchText.isEmpty {
+                searchFocused = false
+            } else {
+                model.searchText = ""
+            }
+            return true
         }
     }
 
@@ -162,6 +197,13 @@ struct WorkbenchSidebarView: View {
                 .pickerStyle(.inline)
             }
             Section("Notifications") {
+                // Denied permission or Do Not Disturb makes notifications vanish
+                // silently, which looks identical to a bug. Say so, and offer the
+                // one place it can be fixed.
+                if let problem = notifier.permission.summary {
+                    Text(problem)
+                    Button("Open Notification Settings…") { notifier.openSystemSettings() }
+                }
                 Toggle("Notify When Task Completes", isOn: Binding(
                     get: { WorkbenchNotifier.notifyOnComplete },
                     set: { WorkbenchNotifier.notifyOnComplete = $0 }))
@@ -194,15 +236,15 @@ struct WorkbenchSidebarView: View {
         HStack {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(theme.secondary)
-            TextField("Search sessions  ·  ⏎ opens best match", text: $model.searchText)
+            TextField("Search sessions  ·  ↑↓ then ⏎", text: $model.searchText)
                 .textFieldStyle(.plain)
                 .font(.system(size: 12))
-                .onSubmit {
-                    if let top = model.topSearchMatch {
-                        model.select(top)
-                        onOpenSession(top)
-                    }
-                }
+                .focused($searchFocused)
+                .onSubmit { openHighlighted() }
+            // Arrow/Enter/Escape reach the list only while this field has focus,
+            // so a focused terminal keeps every key it had before.
+            WorkbenchKeyMonitor(isActive: searchFocused, onKey: handleKey)
+                .frame(width: 0, height: 0)
         }
         .padding(7)
         .background(RoundedRectangle(cornerRadius: 7).fill(theme.elevatedFill))
@@ -279,10 +321,22 @@ struct WorkbenchSidebarView: View {
                                     model.select(session)
                                 }
                                 .contextMenu {
-                                    Button("Resume") { model.select(session); onOpenSession(session) }
-                                    Button("Fork") { onForkSession(session) }
-                                    if session.status == .running {
+                                    // A session running outside Workbench has no
+                                    // window to focus and can't be resumed into a
+                                    // second process, so it gets Fork/End instead
+                                    // of an action that would only fail.
+                                    if model.isRunningElsewhere(session) {
+                                        Button("Fork Session") { onForkSession(session) }
                                         Button("End Session…", role: .destructive) { endTarget = session }
+                                        Text("Running outside Workbench")
+                                    } else {
+                                        Button(session.status == .running ? "Focus" : "Resume") {
+                                            model.select(session); onOpenSession(session)
+                                        }
+                                        Button("Fork") { onForkSession(session) }
+                                        if session.status == .running {
+                                            Button("End Session…", role: .destructive) { endTarget = session }
+                                        }
                                     }
                                     Divider()
                                     Button("Rename…") { renameText = session.localTitle ?? ""; renameTarget = session }

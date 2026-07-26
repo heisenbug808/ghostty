@@ -438,6 +438,41 @@ final class WorkbenchViewModel: ObservableObject {
         }
     }
 
+    /// Sessions in the order they're actually on screen — collapsed groups
+    /// excluded — which is the order arrow keys have to move through.
+    var visibleSessions: [WorkbenchSessionRecord] {
+        worktreeGroups.flatMap { isGroupCollapsed($0.id) ? [] : $0.sessions }
+    }
+
+    /// Moves the selection by `offset` rows, starting at the top when nothing is
+    /// selected yet. Returns the newly selected session so the caller can act on it.
+    @discardableResult
+    func moveSelection(by offset: Int) -> WorkbenchSessionRecord? {
+        let visible = visibleSessions
+        guard !visible.isEmpty else { return nil }
+
+        let current = selectedSessionID.flatMap { id in visible.firstIndex { $0.id == id } }
+        // Arrowing down from nothing lands on the first row, up on the last.
+        let next: Int
+        if let current {
+            next = min(max(current + offset, 0), visible.count - 1)
+        } else {
+            next = offset > 0 ? 0 : visible.count - 1
+        }
+
+        let session = visible[next]
+        selectedSessionID = session.id
+        return session
+    }
+
+    /// True when a session's process is alive but Workbench doesn't own a window
+    /// for it — started from Claude Desktop, another terminal, or a background
+    /// agent. Resuming those would put a second process on one transcript, so the
+    /// UI offers Fork or End instead.
+    func isRunningElsewhere(_ session: WorkbenchSessionRecord) -> Bool {
+        session.status == .running && !WorkbenchSurfaceRegistry.shared.hasWindow(sessionId: session.id)
+    }
+
     // MARK: - Generated titles
 
     /// Sessions with no title of their own, which are the ones worth naming. A

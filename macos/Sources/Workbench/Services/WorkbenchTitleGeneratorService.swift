@@ -22,6 +22,25 @@ final class WorkbenchTitleGeneratorService {
     private static let maxTitleLength = 60
     private static let timeout: TimeInterval = 90
 
+    /// Working directory for the naming calls.
+    ///
+    /// Every `claude -p` invocation records a transcript of its own, so naming 50
+    /// sessions would otherwise add 50 junk sessions to the very list it's meant
+    /// to clean up. Running them all from one directory Workbench owns lets the
+    /// indexer recognize and skip them. (Setting CLAUDE_CODE_CHILD_SESSION does
+    /// *not* suppress the transcript — verified — so this is the reliable way.)
+    /// It also keeps the CLI from loading a project's CLAUDE.md and naming the
+    /// session from that context instead of the transcript.
+    static var scratchDirectory: URL {
+        let base = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+                .appendingPathComponent("Library/Application Support", isDirectory: true)
+        return base
+            .appendingPathComponent("GhosttyClaudeWorkbench", isDirectory: true)
+            .appendingPathComponent("naming", isDirectory: true)
+    }
+
     enum GenerationError: LocalizedError {
         case claudeUnavailable
         case emptyResponse
@@ -126,7 +145,9 @@ final class WorkbenchTitleGeneratorService {
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         process.executableURL = URL(fileURLWithPath: shell)
         process.arguments = ["-l", "-c", "claude -p"]
-        process.currentDirectoryURL = FileManager.default.temporaryDirectory
+        try? FileManager.default.createDirectory(
+            at: scratchDirectory, withIntermediateDirectories: true)
+        process.currentDirectoryURL = scratchDirectory
 
         let input = Pipe()
         let output = Pipe()

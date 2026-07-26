@@ -71,6 +71,9 @@ final class FilesystemClaudeSessionIndexService: WorkbenchSessionIndexing {
             let projectName = url.deletingLastPathComponent().lastPathComponent
             let projectId = projectName.isEmpty ? "unknown" : projectName
             let meta = scrapeMetadata(at: url, mtime: values?.contentModificationDate)
+            // Sessions Workbench itself created to name other sessions aren't
+            // work the user did, so they never belong in the list.
+            if meta.cwd == WorkbenchTitleGeneratorService.scratchDirectory.path { continue }
             sessions.append(WorkbenchSessionRecord(
                 id: id,
                 projectId: projectId,

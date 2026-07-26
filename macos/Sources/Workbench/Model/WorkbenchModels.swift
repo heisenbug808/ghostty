@@ -231,7 +231,10 @@ struct WorkbenchSessionRecord: Identifiable, Codable, Hashable, Sendable {
         var result = self
         result.projectId = indexed.projectId ?? result.projectId
         result.cwd = indexed.cwd ?? result.cwd
-        result.title = indexed.title ?? result.title
+        // Index-owned: assigned rather than merged, so a value the index no longer
+        // reports (a title that was really a derived label written by an older
+        // build) can't linger and masquerade as one Claude Code gave the session.
+        result.title = indexed.title
         result.summary = indexed.summary ?? result.summary
         result.lastModifiedAt = indexed.lastModifiedAt ?? result.lastModifiedAt
         result.transcriptPath = indexed.transcriptPath ?? result.transcriptPath
