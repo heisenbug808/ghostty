@@ -196,6 +196,12 @@ struct WorkbenchTerminalRootView<TerminalContent: View>: View {
             let controller = TerminalController.newTab(ghostty, from: parentWindowProvider(), withBaseConfig: config)
             if let sessionId = built.sessionId {
                 surfaceRegistry.register(sessionId: sessionId, launchId: built.launchId, window: controller?.window)
+                // Carry the user's own name onto the tab; without this the tab
+                // shows whatever the terminal reports and a rename appears to do
+                // nothing outside the sidebar.
+                if let title = model.tabTitle(forSessionId: sessionId) {
+                    controller?.titleOverride = title
+                }
             }
         }
     }

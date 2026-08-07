@@ -117,6 +117,11 @@ final class WorkbenchViewModel: ObservableObject {
         // constructing the model must have zero filesystem side effects.
         guard WorkbenchFeature.isEnabled else { return }
         agentEvents.ensureDirectoryExists()
+        // Closing a tab must free the session, or reopening it is refused as
+        // locked until the staleness grace expires.
+        WorkbenchSurfaceRegistry.shared.onWindowClosed = { [weak self] sessionId in
+            Task { @MainActor in await self?.releaseClosedSession(sessionId) }
+        }
         Task { await refresh() }
         startFileWatcher()
     }
@@ -343,6 +348,7 @@ final class WorkbenchViewModel: ObservableObject {
             let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
             $0.localTitle = trimmed.isEmpty ? nil : trimmed
         }
+        applyTabTitle(forSessionId: session.id)
     }
 
     private func mutate(_ session: WorkbenchSessionRecord, _ block: (inout WorkbenchSessionRecord) -> Void) {
@@ -436,6 +442,36 @@ final class WorkbenchViewModel: ObservableObject {
                 state: state,
                 cwd: session?.cwd ?? event.cwd)
         }
+    }
+
+    /// The name the user gave this session, if any. Only an explicit rename is
+    /// pushed to the tab — Claude's own titles already reach the terminal title on
+    /// their own, and derived labels are list decoration, not a window name.
+    func tabTitle(forSessionId sessionId: String) -> String? {
+        guard let title = sessions.first(where: { $0.id == sessionId })?.localTitle,
+              !title.isEmpty else { return nil }
+        return title
+    }
+
+    /// Applies the Workbench name to the tab showing this session, so a rename is
+    /// reflected where the session actually is and not only in the list.
+    func applyTabTitle(forSessionId sessionId: String) {
+        guard let window = WorkbenchSurfaceRegistry.shared.window(for: sessionId),
+              let controller = TerminalController.all.first(where: { $0.window === window })
+        else { return }
+        // nil restores the terminal's own title when a rename is cleared.
+        controller.titleOverride = tabTitle(forSessionId: sessionId)
+    }
+
+    /// Frees a session whose Workbench window just closed, so it can be reopened
+    /// immediately instead of waiting out the lock's staleness grace.
+    private func releaseClosedSession(_ sessionId: String) async {
+        try? await WorkbenchLockService(store: store).release(sessionId: sessionId)
+        if let index = sessions.firstIndex(where: { $0.id == sessionId }),
+           sessions[index].status == .launching {
+            sessions[index].status = .idle
+        }
+        await refresh()
     }
 
     /// Sessions in the order they're actually on screen — collapsed groups

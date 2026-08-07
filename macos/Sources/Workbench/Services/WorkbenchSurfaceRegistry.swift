@@ -16,13 +16,27 @@ final class WorkbenchSurfaceRegistry: ObservableObject {
         let sessionId: String
         let launchId: String
         weak var window: NSWindow?
+        /// Token for the close observer, removed when this entry goes away.
+        var closeObserver: NSObjectProtocol?
 
         init(sessionId: String, launchId: String, window: NSWindow?) {
             self.sessionId = sessionId
             self.launchId = launchId
             self.window = window
         }
+
+        deinit {
+            if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
+        }
     }
+
+    /// Called with the session id when a window Workbench opened is closed.
+    ///
+    /// Closing a tab has to release that session's lock. Without this the lock
+    /// stayed held until the staleness grace expired, so reopening the session in
+    /// the next ~45 seconds was refused as already locked — closing a tab appeared
+    /// to break the session.
+    var onWindowClosed: ((String) -> Void)?
 
     private var entriesBySession: [String: Entry] = [:]
     private var entriesByLaunch: [String: Entry] = [:]
@@ -35,8 +49,32 @@ final class WorkbenchSurfaceRegistry: ObservableObject {
             entriesByLaunch.removeValue(forKey: previous.launchId)
         }
         let entry = Entry(sessionId: sessionId, launchId: launchId, window: window)
+        entry.closeObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            // Hop to the main actor rather than asserting we're already on it:
+            // `assumeIsolated` traps when the assumption doesn't hold, which would
+            // turn "closed a tab" into a crash.
+            Task { @MainActor in
+                guard let self else { return }
+                // Only clear if this exact launch still owns the session: a newer
+                // launch may already have replaced it.
+                if self.entriesBySession[sessionId]?.launchId == launchId {
+                    self.unregister(launchId: launchId)
+                    self.onWindowClosed?(sessionId)
+                }
+            }
+        }
         entriesBySession[sessionId] = entry
         entriesByLaunch[launchId] = entry
+    }
+
+    /// The window Workbench opened for a session, if it's still around.
+    func window(for sessionId: String) -> NSWindow? {
+        cleanupStaleEntries()
+        return entriesBySession[sessionId]?.window
     }
 
     /// The session running in a given window, if any — used to drive the sidebar
