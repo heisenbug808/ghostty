@@ -1,3 +1,4 @@
+import SwiftUI
 import XCTest
 @testable import Ghostty
 
@@ -635,6 +636,378 @@ final class WorkbenchTests: XCTestCase {
         // Archived always wins.
         session.isArchived = true
         XCTAssertFalse(session.needsReview)
+    }
+
+    // MARK: - Generated titles
+
+    func testTitleExcerptTakesOpeningConversationOnly() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wb-title-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let url = dir.appendingPathComponent("t.jsonl")
+        try ([
+            #"{"type":"mode","mode":"auto"}"#,
+            // Scaffolding must not be the thing we ask Claude to name.
+            #"{"type":"user","message":{"role":"user","content":"<command-name>/model</command-name>"}}"#,
+            #"{"type":"user","message":{"role":"user","content":"PE-11318 look at the dashboard"}}"#,
+            #"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"Reading the code."}]}}"#,
+            // Subagent turns aren't this session's conversation.
+            #"{"type":"user","isSidechain":true,"message":{"role":"user","content":"subagent work"}}"#,
+            #"{"type":"user","message":{"role":"user","content":"third"}}"#,
+        ].joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+
+        let excerpt = try XCTUnwrap(WorkbenchTitleGeneratorService.excerpt(atPath: url.path))
+        let lines = excerpt.split(separator: "\n").map(String.init)
+        XCTAssertEqual(lines, [
+            "User: PE-11318 look at the dashboard",
+            "Claude: Reading the code.",
+            "User: third",
+        ])
+        // Thinking blocks and scaffolding are absent.
+        XCTAssertFalse(excerpt.contains("hmm"))
+        XCTAssertFalse(excerpt.contains("command-name"))
+        XCTAssertFalse(excerpt.contains("subagent"))
+
+        // Honors the turn budget: this is the *opening*, not the whole transcript.
+        let capped = try XCTUnwrap(WorkbenchTitleGeneratorService.excerpt(atPath: url.path, turns: 2))
+        XCTAssertEqual(capped.split(separator: "\n").count, 2)
+
+        XCTAssertNil(WorkbenchTitleGeneratorService.excerpt(atPath: "/nope/missing.jsonl"))
+    }
+
+    func testTitleSanitizeStripsModelDressing() {
+        XCTAssertEqual(
+            WorkbenchTitleGeneratorService.sanitize("PE-11318 customer success dashboard plan"),
+            "PE-11318 customer success dashboard plan")
+        // Quotes, markdown emphasis and trailing punctuation are not part of a title.
+        XCTAssertEqual(WorkbenchTitleGeneratorService.sanitize("\"Fix the parser\""), "Fix the parser")
+        XCTAssertEqual(WorkbenchTitleGeneratorService.sanitize("**Fix the parser**"), "Fix the parser")
+        XCTAssertEqual(WorkbenchTitleGeneratorService.sanitize("Fix the parser."), "Fix the parser")
+        // Only the first non-empty line.
+        XCTAssertEqual(WorkbenchTitleGeneratorService.sanitize("\n\nFix parser\nsome rambling"), "Fix parser")
+        XCTAssertNil(WorkbenchTitleGeneratorService.sanitize("   "))
+        XCTAssertNil(WorkbenchTitleGeneratorService.sanitize(""))
+        // An explanation instead of a title is rejected rather than shown as one.
+        XCTAssertNil(WorkbenchTitleGeneratorService.sanitize(
+            String(repeating: "this is a long explanation rather than a title ", count: 5)))
+    }
+
+    // MARK: - Incremental indexing
+
+    /// The active session's transcript is the biggest file and the one written to
+    /// constantly, so it's re-indexed continuously. Appending must be folded into
+    /// the cached state rather than rescanned, and the result has to be identical
+    /// to a scan from scratch — including a line that arrives split across two
+    /// scrapes, which is what a scrape landing mid-write sees.
+    func testIncrementalScrapeMatchesFullScan() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wb-index-\(UUID().uuidString)", isDirectory: true)
+        let projects = dir.appendingPathComponent("projects/-Users-someone-repo", isDirectory: true)
+        try FileManager.default.createDirectory(at: projects, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let sessionId = "11111111-2222-3333-4444-555555555555"
+        let url = projects.appendingPathComponent("\(sessionId).jsonl")
+
+        func append(_ text: String) throws {
+            let handle = try FileHandle(forWritingTo: url)
+            try handle.seekToEnd()
+            try handle.write(contentsOf: Data(text.utf8))
+            try handle.close()
+            // Distinct mtimes, so the cache can't be reused by accident.
+            try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
+        }
+
+        let first = #"{"type":"user","cwd":"/Users/someone/repo","message":{"role":"user","content":"investigate the stuck referrals"}}"# + "\n"
+        try Data(first.utf8).write(to: url)
+
+        let service = FilesystemClaudeSessionIndexService(configDirectory: dir)
+        var sessions = try await service.indexedSessions()
+        XCTAssertEqual(sessions.count, 1)
+        XCTAssertEqual(sessions[0].messageCount, 1)
+        // No title of its own, so the derived label is what the list shows.
+        XCTAssertNil(sessions[0].title)
+        XCTAssertEqual(sessions[0].derivedLabel, "investigate the stuck referrals")
+        XCTAssertEqual(sessions[0].displayTitle, "investigate the stuck referrals")
+        XCTAssertEqual(sessions[0].cwd, "/Users/someone/repo")
+
+        // Append more, including a title that must win over the derived label.
+        try append(#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"looking"}]}}"# + "\n")
+        try append(#"{"type":"custom-title","customTitle":"referral-triage"}"# + "\n")
+        sessions = try await service.indexedSessions()
+        XCTAssertEqual(sessions[0].messageCount, 2, "counts must accumulate, not reset")
+        // A real title outranks the derived label.
+        XCTAssertEqual(sessions[0].title, "referral-triage")
+        XCTAssertEqual(sessions[0].displayTitle, "referral-triage")
+        XCTAssertEqual(sessions[0].lastMessageWasAssistant, true)
+
+        // A complete line with no trailing newline still counts — a transcript
+        // that simply doesn't end in one would otherwise lose its last message —
+        // and must not be counted a second time when the newline arrives.
+        try append(#"{"type":"user","message":{"role":"user","content":"and now"}}"#)
+        sessions = try await service.indexedSessions()
+        XCTAssertEqual(sessions[0].messageCount, 3, "trailing line without a newline still counts")
+        try append("\n")
+        sessions = try await service.indexedSessions()
+        XCTAssertEqual(sessions[0].messageCount, 3, "and is not counted twice once completed")
+        XCTAssertEqual(sessions[0].lastMessageWasAssistant, false)
+
+        // Truncated JSON caught mid-write folds to nothing rather than corrupting
+        // the accumulated state.
+        try append(#"{"type":"user","message":{"role":"user","cont"#)
+        sessions = try await service.indexedSessions()
+        XCTAssertEqual(sessions[0].messageCount, 3, "half-written line is ignored")
+
+        // Same bytes, cold service: incremental and full scans must agree.
+        let cold = try await FilesystemClaudeSessionIndexService(configDirectory: dir).indexedSessions()
+        XCTAssertEqual(cold[0].messageCount, sessions[0].messageCount)
+        XCTAssertEqual(cold[0].title, sessions[0].title)
+        XCTAssertEqual(cold[0].derivedLabel, sessions[0].derivedLabel)
+        XCTAssertEqual(cold[0].summary, sessions[0].summary)
+        XCTAssertEqual(cold[0].lastMessageWasAssistant, sessions[0].lastMessageWasAssistant)
+    }
+
+    /// A rewritten (shorter) file can't be resumed from a stale offset.
+    func testScrapeRescansWhenTranscriptShrinks() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wb-index2-\(UUID().uuidString)", isDirectory: true)
+        let projects = dir.appendingPathComponent("projects/-Users-someone-repo", isDirectory: true)
+        try FileManager.default.createDirectory(at: projects, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let url = projects.appendingPathComponent("22222222-2222-3333-4444-555555555555.jsonl")
+        let long = (0..<6).map { _ in
+            #"{"type":"user","message":{"role":"user","content":"first version"}}"#
+        }.joined(separator: "\n") + "\n"
+        try Data(long.utf8).write(to: url)
+
+        let service = FilesystemClaudeSessionIndexService(configDirectory: dir)
+        var sessions = try await service.indexedSessions()
+        XCTAssertEqual(sessions[0].messageCount, 6)
+
+        let short = #"{"type":"user","message":{"role":"user","content":"rewritten"}}"# + "\n"
+        try Data(short.utf8).write(to: url)
+        try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
+
+        sessions = try await service.indexedSessions()
+        XCTAssertEqual(sessions[0].messageCount, 1, "shrunken file must be rescanned from the start")
+        XCTAssertEqual(sessions[0].derivedLabel, "rewritten")
+    }
+
+    // MARK: - Session labels
+
+    /// The rejected strings here are verbatim from real transcripts: two thirds of
+    /// sessions have no title from Claude Code, and these are what the list was
+    /// falling back to.
+    func testSessionLabelRejectsHarnessScaffolding() {
+        XCTAssertTrue(WorkbenchSessionLabel.isScaffolding(
+            "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands"))
+        XCTAssertTrue(WorkbenchSessionLabel.isScaffolding(
+            "<local-command-stdout>Cancelled</local-command-stdout>"))
+        XCTAssertTrue(WorkbenchSessionLabel.isScaffolding(
+            "<local-command-stdout>Set model to Fable 5 and saved as your default</local-command-stdout>"))
+        XCTAssertTrue(WorkbenchSessionLabel.isScaffolding("<command-name>/clear</command-name>"))
+        XCTAssertTrue(WorkbenchSessionLabel.isScaffolding("<command-message>pr-fix</command-message>"))
+        XCTAssertTrue(WorkbenchSessionLabel.isScaffolding("   "))
+        // Found by auditing the real corpus: these were becoming session titles.
+        XCTAssertTrue(WorkbenchSessionLabel.isScaffolding(
+            "<task-notification>\n<task-id>a4ad376a5bc2aed95</task-id>"))
+        XCTAssertTrue(WorkbenchSessionLabel.isScaffolding("<bash-input>git stat</bash-input>"))
+        XCTAssertTrue(WorkbenchSessionLabel.isScaffolding(
+            "<bash-stdout></bash-stdout><bash-stderr>git: 'stat' is not a git command"))
+        XCTAssertTrue(WorkbenchSessionLabel.isScaffolding("<system-reminder>be careful</system-reminder>"))
+
+        // Pasted markup is real content the user typed, not scaffolding.
+        XCTAssertFalse(WorkbenchSessionLabel.isScaffolding("<div>why does this not center</div>"))
+        XCTAssertFalse(WorkbenchSessionLabel.isScaffolding("<html> tag rendering is broken"))
+
+        XCTAssertNil(WorkbenchSessionLabel.label(for: "<local-command-stdout>Cancelled</local-command-stdout>"))
+        XCTAssertNil(WorkbenchSessionLabel.label(for: nil))
+
+        // A prompt that merely mentions a marker later on is still a real prompt.
+        XCTAssertFalse(WorkbenchSessionLabel.isScaffolding(
+            String(repeating: "explain this to me please ", count: 8) + "<command-name>"))
+    }
+
+    func testSessionLabelHoistsTicketAndDropsURL() {
+        // Real shape: ClickUp URL, then the actual request.
+        let label = WorkbenchSessionLabel.label(
+            for: "https://app.clickup.com/t/42081486/CS-63034   你看看这个ticket 在讲什么 该怎么做")
+        XCTAssertEqual(label, "CS-63034 · 你看看这个ticket 在讲什么 该怎么做")
+        XCTAssertFalse(label?.contains("clickup.com") ?? true, "URL should be dropped")
+
+        // GitHub pull requests read as repo#number.
+        XCTAssertEqual(
+            WorkbenchSessionLabel.label(
+                for: "https://github.com/sugerio/marketplace-service/pull/6971 please use a worktree"),
+            "marketplace-service#6971 · please use a worktree")
+
+        // A ticket already leading the prompt must not be repeated.
+        XCTAssertEqual(
+            WorkbenchSessionLabel.label(for: "PE-11325 帮我看看这个ticket"),
+            "PE-11325 · 帮我看看这个ticket")
+
+        // Ticket with no other text stands alone.
+        XCTAssertEqual(
+            WorkbenchSessionLabel.label(for: "https://app.clickup.com/t/42081486/CS-54781"),
+            "CS-54781")
+    }
+
+    func testSessionLabelNormalizesAndTruncates() {
+        XCTAssertEqual(WorkbenchSessionLabel.label(for: "  commit 并开pr  "), "commit 并开pr")
+        // Newlines and runs of spaces collapse so the label stays one line.
+        XCTAssertEqual(
+            WorkbenchSessionLabel.label(for: "fix the\n\nbug   in    parser"),
+            "fix the bug in parser")
+
+        let long = String(repeating: "long ", count: 60)
+        let label = WorkbenchSessionLabel.label(for: long)
+        XCTAssertNotNil(label)
+        XCTAssertLessThanOrEqual(label!.count, WorkbenchSessionLabel.maxLength + 1)
+        XCTAssertTrue(label!.hasSuffix("…"))
+    }
+
+    // MARK: - Transcript content search
+
+    private func writeTranscript(_ lines: [String], to directory: URL, name: String) throws -> String {
+        let url = directory.appendingPathComponent(name)
+        try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        return url.path
+    }
+
+    func testTranscriptSearchFindsContentAndBuildsProseSnippet() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wb-search-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let a = try writeTranscript([
+            #"{"type":"user","message":{"role":"user","content":"why are the referrals stuck in pending create"}}"#,
+            #"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Because the batch workflow collided."}]}}"#,
+        ], to: dir, name: "a.jsonl")
+        let b = try writeTranscript([
+            #"{"type":"user","message":{"role":"user","content":"unrelated question about billing"}}"#,
+        ], to: dir, name: "b.jsonl")
+
+        let service = WorkbenchTranscriptSearchService()
+        let targets = [
+            WorkbenchTranscriptSearchService.Target(sessionId: "A", path: a, modifiedAt: Date()),
+            WorkbenchTranscriptSearchService.Target(sessionId: "B", path: b, modifiedAt: Date()),
+        ]
+
+        let hits = try await service.search(query: "pending create", in: targets)
+        XCTAssertEqual(hits.map(\.sessionId), ["A"])
+        // Snippet is the message prose, not the raw JSON line.
+        let snippet = hits[0].snippet
+        XCTAssertTrue(snippet.localizedCaseInsensitiveContains("pending create"), snippet)
+        XCTAssertFalse(snippet.contains("\"role\""), "snippet should not leak JSON: \(snippet)")
+
+        // Case-insensitive, and matches in assistant turns count too.
+        let both = try await service.search(query: "COLLIDED", in: targets)
+        XCTAssertEqual(both.map(\.sessionId), ["A"])
+
+        // Searching for an id usually hits a tool result payload, not conversation.
+        // The snippet must still read as prose rather than escaped JSON.
+        let c = try writeTranscript([
+            #"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":[{"type":"text","text":"{\"custom_id\":\"CS-61264\",\"name\":\"Referrals Stuck in Pending Create\"}"}]}]}}"#,
+        ], to: dir, name: "c.jsonl")
+        let payload = try await service.search(
+            query: "CS-61264",
+            in: [.init(sessionId: "C", path: c, modifiedAt: Date())])
+        XCTAssertEqual(payload.map(\.sessionId), ["C"])
+        let payloadSnippet = payload[0].snippet
+        XCTAssertTrue(payloadSnippet.contains("CS-61264"), payloadSnippet)
+        XCTAssertFalse(payloadSnippet.contains("\\\""), "escaped JSON leaked: \(payloadSnippet)")
+        XCTAssertFalse(payloadSnippet.contains("tool_use_id"), "raw line leaked: \(payloadSnippet)")
+
+        let absent = try await service.search(query: "nonexistent phrase", in: targets)
+        XCTAssertTrue(absent.isEmpty)
+        // Too short to be worth scanning a corpus for.
+        let tooShort = try await service.search(query: "a", in: targets)
+        XCTAssertTrue(tooShort.isEmpty)
+    }
+
+    func testTranscriptSearchRanksByMatchCountAndSpansChunkBoundaries() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wb-search2-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let few = try writeTranscript([
+            #"{"type":"user","message":{"role":"user","content":"tailscale once"}}"#,
+        ], to: dir, name: "few.jsonl")
+        let many = try writeTranscript((0..<5).map { _ in
+            #"{"type":"user","message":{"role":"user","content":"tailscale again"}}"#
+        }, to: dir, name: "many.jsonl")
+
+        // A single line larger than the read chunk (256 KB), with the match past
+        // the boundary — this is the case naive chunked scanning gets wrong.
+        let padding = String(repeating: "x", count: 400_000)
+        let huge = try writeTranscript([
+            #"{"type":"user","message":{"role":"user","content":"\#(padding) tailscale buried deep"}}"#,
+        ], to: dir, name: "huge.jsonl")
+
+        let service = WorkbenchTranscriptSearchService()
+        let now = Date()
+        let hits = try await service.search(query: "tailscale", in: [
+            .init(sessionId: "FEW", path: few, modifiedAt: now),
+            .init(sessionId: "MANY", path: many, modifiedAt: now),
+            .init(sessionId: "HUGE", path: huge, modifiedAt: now),
+        ])
+
+        XCTAssertEqual(Set(hits.map(\.sessionId)), ["FEW", "MANY", "HUGE"])
+        XCTAssertEqual(hits.first?.sessionId, "MANY", "more matches should rank first")
+        XCTAssertEqual(hits.first(where: { $0.sessionId == "MANY" })?.matchCount, 5)
+        XCTAssertEqual(hits.first(where: { $0.sessionId == "FEW" })?.matchCount, 1)
+    }
+
+    // MARK: - Theme
+
+    /// The whole point of deriving chrome colors from the terminal is that a dark
+    /// terminal gets dark chrome. Luminance decides it — not the system
+    /// appearance — so a light terminal theme while macOS is in dark mode still
+    /// gets dark-on-light chrome, and vice versa.
+    func testThemeDarknessFollowsBackgroundLuminanceNotSystemAppearance() {
+        let dark = WorkbenchTheme(background: Color(red: 0.07, green: 0.07, blue: 0.10), opacity: 1, isDark: true)
+        XCTAssertTrue(dark.isDark)
+
+        // Derived via the real initializer path (luminance), for a range of colors.
+        func isDark(_ red: Double, _ green: Double, _ blue: Double) -> Bool {
+            WorkbenchTheme(
+                background: Color(red: red, green: green, blue: blue),
+                opacity: 1,
+                isDark: WorkbenchTheme.backgroundIsDark(Color(red: red, green: green, blue: blue))
+            ).isDark
+        }
+
+        XCTAssertTrue(isDark(0, 0, 0), "black background")
+        XCTAssertTrue(isDark(0.07, 0.07, 0.10), "typical dark terminal theme")
+        XCTAssertTrue(isDark(0.15, 0.11, 0.20), "dark purple theme")
+        XCTAssertFalse(isDark(1, 1, 1), "white background")
+        XCTAssertFalse(isDark(0.98, 0.96, 0.93), "solarized-light-ish background")
+
+        // Green dominates perceived luminance, blue barely registers: pure blue is
+        // dark, pure green is not. A naive average would get both wrong.
+        XCTAssertTrue(isDark(0, 0, 1), "pure blue reads as dark")
+        XCTAssertFalse(isDark(0, 1, 0), "pure green reads as light")
+    }
+
+    func testThemeClampsOpacityToStayLegible() {
+        // A fully transparent terminal would otherwise leave unreadable chrome.
+        XCTAssertEqual(WorkbenchTheme.clampOpacity(0), 0.35, accuracy: 0.001)
+        XCTAssertEqual(WorkbenchTheme.clampOpacity(0.2), 0.35, accuracy: 0.001)
+        XCTAssertEqual(WorkbenchTheme.clampOpacity(0.8), 0.8, accuracy: 0.001)
+        XCTAssertEqual(WorkbenchTheme.clampOpacity(1), 1, accuracy: 0.001)
+        XCTAssertEqual(WorkbenchTheme.clampOpacity(1.5), 1, accuracy: 0.001)
+    }
+
+    func testDensityDrivesRowPaddingAndSubtitle() {
+        XCTAssertTrue(WorkbenchDensity.comfortable.showsSubtitle)
+        XCTAssertFalse(WorkbenchDensity.compact.showsSubtitle)
+        XCTAssertLessThan(WorkbenchDensity.compact.rowPadding, WorkbenchDensity.comfortable.rowPadding)
+        XCTAssertEqual(WorkbenchDensity(rawValue: "compact"), .compact)
     }
 
     // MARK: - Transcript reader

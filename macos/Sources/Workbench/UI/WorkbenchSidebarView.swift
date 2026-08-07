@@ -12,6 +12,13 @@ struct WorkbenchSidebarView: View {
     @State private var worktreeDirectory: String?
     @State private var worktreeName: String = ""
     @State private var endTarget: WorkbenchSessionRecord?
+    @State private var isConfirmingTitleGeneration = false
+    // Mirrored into @State rather than read straight from UserDefaults so the
+    // list re-renders the moment the menu changes it.
+    @State private var density: WorkbenchDensity = WorkbenchFeature.density
+    @Environment(\.workbenchTheme) private var theme
+    @FocusState private var searchFocused: Bool
+    @ObservedObject private var notifier = WorkbenchNotifier.shared
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,7 +31,10 @@ struct WorkbenchSidebarView: View {
             footer
         }
         .frame(maxWidth: .infinity)
-        .background(Color(nsColor: .controlBackgroundColor))
+        .background(WorkbenchChromeBackground())
+        .foregroundStyle(theme.primary)
+        .onChange(of: density) { newValue in WorkbenchFeature.density = newValue }
+        .onAppear { notifier.refreshPermission() }
         .alert("Rename Session", isPresented: renameBinding) {
             TextField("Display name", text: $renameText)
             Button("Save") {
@@ -46,6 +56,12 @@ struct WorkbenchSidebarView: View {
             }
             Button("Cancel", role: .cancel) { worktreeDirectory = nil }
         }
+        .alert("Name Untitled Sessions?", isPresented: $isConfirmingTitleGeneration) {
+            Button("Name Sessions") { Task { await model.generateMissingTitles() } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Workbench will run the claude CLI once per session, reading the first few messages of each to name it. That uses your Claude quota and takes a few seconds each. \(model.sessionsNeedingTitles.count) session(s) have no title.")
+        }
         .alert("End Session?", isPresented: endBinding, presenting: endTarget) { session in
             Button("End Session", role: .destructive) {
                 let target = session
@@ -55,6 +71,38 @@ struct WorkbenchSidebarView: View {
             Button("Cancel", role: .cancel) { endTarget = nil }
         } message: { session in
             Text("This terminates the running Claude process for “\(session.displayTitle)”. Any unsaved work in that session is lost. Use this to clean up background sessions that have no window.")
+        }
+    }
+
+    /// Opens whatever the keyboard is pointing at: the highlighted row, or the
+    /// best search match when the user hasn't arrowed anywhere yet.
+    private func openHighlighted() {
+        let target = model.selectedSession ?? model.topSearchMatch
+        guard let target else { return }
+        model.select(target)
+        onOpenSession(target)
+    }
+
+    private func handleKey(_ key: WorkbenchKey) -> Bool {
+        switch key {
+        case .down:
+            model.moveSelection(by: 1)
+            return true
+        case .up:
+            model.moveSelection(by: -1)
+            return true
+        case .enter:
+            openHighlighted()
+            return true
+        case .escape:
+            // First press clears the query, a second gives focus back to the
+            // terminal — Escape shouldn't strand you in the sidebar.
+            if model.searchText.isEmpty {
+                searchFocused = false
+            } else {
+                model.searchText = ""
+            }
+            return true
         }
     }
 
@@ -108,7 +156,7 @@ struct WorkbenchSidebarView: View {
                 model.toggleDetails()
             } label: {
                 Image(systemName: "sidebar.right")
-                    .foregroundStyle(model.isDetailsVisible ? Color.accentColor : Color.secondary)
+                    .foregroundStyle(model.isDetailsVisible ? Color.accentColor : theme.secondary)
             }
             .buttonStyle(.borderless)
             .help(model.isDetailsVisible ? "Hide details panel" : "Show details panel")
@@ -140,13 +188,37 @@ struct WorkbenchSidebarView: View {
                      ? "Installed — sessions report live state"
                      : "Not installed — status is inferred")
             }
+            Section("Appearance") {
+                Picker("Row Density", selection: $density) {
+                    ForEach(WorkbenchDensity.allCases, id: \.self) { option in
+                        Text(option.label).tag(option)
+                    }
+                }
+                .pickerStyle(.inline)
+            }
             Section("Notifications") {
+                // Denied permission or Do Not Disturb makes notifications vanish
+                // silently, which looks identical to a bug. Say so, and offer the
+                // one place it can be fixed.
+                if let problem = notifier.permission.summary {
+                    Text(problem)
+                    Button("Open Notification Settings…") { notifier.openSystemSettings() }
+                }
                 Toggle("Notify When Task Completes", isOn: Binding(
                     get: { WorkbenchNotifier.notifyOnComplete },
                     set: { WorkbenchNotifier.notifyOnComplete = $0 }))
                 Toggle("Notify When Awaiting Input", isOn: Binding(
                     get: { WorkbenchNotifier.notifyOnAwaitingInput },
                     set: { WorkbenchNotifier.notifyOnAwaitingInput = $0 }))
+            }
+            Section("Titles") {
+                let pending = model.sessionsNeedingTitles.count
+                Button(model.isGeneratingTitles
+                       ? "Naming sessions…"
+                       : "Name \(pending) Untitled Session(s)…") {
+                    isConfirmingTitleGeneration = true
+                }
+                .disabled(model.isGeneratingTitles || pending == 0)
             }
             Divider()
             // Rarely needed now that FSEvents drives updates, so it lives here
@@ -163,19 +235,19 @@ struct WorkbenchSidebarView: View {
     private var search: some View {
         HStack {
             Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
-            TextField("Search sessions  ·  ⏎ opens best match", text: $model.searchText)
+                .foregroundStyle(theme.secondary)
+            TextField("Search sessions  ·  ↑↓ then ⏎", text: $model.searchText)
                 .textFieldStyle(.plain)
                 .font(.system(size: 12))
-                .onSubmit {
-                    if let top = model.topSearchMatch {
-                        model.select(top)
-                        onOpenSession(top)
-                    }
-                }
+                .focused($searchFocused)
+                .onSubmit { openHighlighted() }
+            // Arrow/Enter/Escape reach the list only while this field has focus,
+            // so a focused terminal keeps every key it had before.
+            WorkbenchKeyMonitor(isActive: searchFocused, onKey: handleKey)
+                .frame(width: 0, height: 0)
         }
         .padding(7)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .textBackgroundColor)))
+        .background(RoundedRectangle(cornerRadius: 7).fill(theme.elevatedFill))
         .padding(.horizontal, 10)
         .padding(.bottom, 8)
     }
@@ -195,12 +267,12 @@ struct WorkbenchSidebarView: View {
                             Text("\(count)").font(.caption2).monospacedDigit()
                         }
                     }
-                    .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+                    .foregroundStyle(selected ? Color.accentColor : theme.secondary)
                     .padding(.horizontal, 7)
                     .padding(.vertical, 3)
                     .background(
                         RoundedRectangle(cornerRadius: 6)
-                            .fill(selected ? Color.accentColor.opacity(0.18) : Color.clear)
+                            .fill(selected ? theme.selectionFill : Color.clear)
                     )
                     .contentShape(Rectangle())
                 }
@@ -229,10 +301,14 @@ struct WorkbenchSidebarView: View {
                                     session: session,
                                     worktreePath: group.path,
                                     isSelected: model.selectedSessionID == session.id,
+                                    density: density,
                                     onPin: { model.togglePinned(session) },
                                     onArchive: { model.toggleArchived(session) }
                                 )
                                 .id(session.id)
+                                // Filtering/searching rewrites the list wholesale;
+                                // a fade keeps rows from snapping in and out.
+                                .transition(.opacity)
                                 .contentShape(Rectangle())
                                 // Double-click opens; a single click only selects, so
                                 // you can inspect a session in the details panel
@@ -245,10 +321,22 @@ struct WorkbenchSidebarView: View {
                                     model.select(session)
                                 }
                                 .contextMenu {
-                                    Button("Resume") { model.select(session); onOpenSession(session) }
-                                    Button("Fork") { onForkSession(session) }
-                                    if session.status == .running {
+                                    // A session running outside Workbench has no
+                                    // window to focus and can't be resumed into a
+                                    // second process, so it gets Fork/End instead
+                                    // of an action that would only fail.
+                                    if model.isRunningElsewhere(session) {
+                                        Button("Fork Session") { onForkSession(session) }
                                         Button("End Session…", role: .destructive) { endTarget = session }
+                                        Text("Running outside Workbench")
+                                    } else {
+                                        Button(session.status == .running ? "Focus" : "Resume") {
+                                            model.select(session); onOpenSession(session)
+                                        }
+                                        Button("Fork") { onForkSession(session) }
+                                        if session.status == .running {
+                                            Button("End Session…", role: .destructive) { endTarget = session }
+                                        }
                                     }
                                     Divider()
                                     Button("Rename…") { renameText = session.localTitle ?? ""; renameTarget = session }
@@ -281,8 +369,13 @@ struct WorkbenchSidebarView: View {
                         )
                     }
                 }
+                transcriptMatches
             }
             .listStyle(.sidebar)
+            // Keyed on the two things that rewrite the list, never on the refresh
+            // tick — otherwise every FSEvents poll would re-animate the sidebar.
+            .animation(.easeInOut(duration: 0.18), value: model.filter)
+            .animation(.easeInOut(duration: 0.18), value: model.searchText)
             .overlay {
                 if model.worktreeGroups.isEmpty { emptyState }
             }
@@ -304,11 +397,11 @@ struct WorkbenchSidebarView: View {
         VStack(spacing: 8) {
             Image(systemName: emptyIcon)
                 .font(.system(size: 26))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(theme.secondary)
             Text(emptyTitle).font(.callout.weight(.medium))
             Text(emptySubtitle)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(theme.secondary)
                 .multilineTextAlignment(.center)
         }
         .padding(24)
@@ -331,11 +424,63 @@ struct WorkbenchSidebarView: View {
         return "Use + to start one, or run claude in a terminal."
     }
 
+    /// Sessions found by transcript content rather than title. Kept in its own
+    /// section so it's clear these matched on what was said inside them, and shown
+    /// only for sessions the title filter didn't already list.
+    @ViewBuilder
+    private var transcriptMatches: some View {
+        let matches = model.contentOnlyHits
+        if model.isSearchingContent || !matches.isEmpty {
+            Section {
+                if matches.isEmpty {
+                    Text("Searching…")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(theme.tertiary)
+                } else {
+                    ForEach(matches, id: \.hit.id) { match in
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 6) {
+                                WorkbenchStatusDot(session: match.session)
+                                Text(match.session.displayTitle)
+                                    .font(.system(size: 12))
+                                    .lineLimit(1)
+                                Spacer(minLength: 4)
+                                Text("\(match.hit.matchCount)")
+                                    .font(.system(size: 9.5))
+                                    .monospacedDigit()
+                                    .foregroundStyle(theme.tertiary)
+                            }
+                            Text(match.hit.snippet)
+                                .font(.system(size: 10))
+                                .foregroundStyle(theme.tertiary)
+                                .lineLimit(2)
+                        }
+                        .padding(.vertical, 3)
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) {
+                            model.select(match.session)
+                            onOpenSession(match.session)
+                        }
+                        .onTapGesture { model.select(match.session) }
+                    }
+                }
+            } header: {
+                HStack(spacing: 5) {
+                    Image(systemName: "text.magnifyingglass").font(.caption2)
+                    Text("In transcripts")
+                        .font(.system(size: 11, weight: .semibold))
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(theme.secondary)
+            }
+        }
+    }
+
     private var footer: some View {
         HStack(spacing: 4) {
             Text(model.statusMessage ?? "Workbench ready")
                 .font(.system(size: 10.5))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(theme.tertiary)
                 .lineLimit(2)
             Spacer(minLength: 0)
         }
@@ -346,6 +491,7 @@ struct WorkbenchSidebarView: View {
 }
 
 private struct WorkbenchWorktreeHeader: View {
+    @Environment(\.workbenchTheme) private var theme
     let group: WorkbenchWorktreeGroup
     let isCollapsed: Bool
     let onToggle: () -> Void
@@ -356,27 +502,28 @@ private struct WorkbenchWorktreeHeader: View {
             HStack(spacing: 6) {
                 Image(systemName: "chevron.right")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondary)
                     .rotationEffect(.degrees(isCollapsed ? 0 : 90))
                     .animation(.easeInOut(duration: 0.15), value: isCollapsed)
                 Image(systemName: icon)
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(hue)
                 Text(group.repoName)
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 if let branch = group.branch {
                     // A pill keeps the branch from reading as part of the repo name.
                     Text(branch)
                         .font(.system(size: 9.5, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(theme.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .padding(.horizontal, 4)
                         .padding(.vertical, 1)
-                        .background(RoundedRectangle(cornerRadius: 3).fill(Color.primary.opacity(0.07)))
+                        .background(RoundedRectangle(cornerRadius: 3)
+                            .fill(hue.opacity(theme.isDark ? 0.20 : 0.13)))
                 }
                 if let dirty = group.dirty, dirty > 0 {
                     Text("±\(dirty)")
@@ -411,12 +558,34 @@ private struct WorkbenchWorktreeHeader: View {
         if !group.isGit { return "folder" }
         return group.isLinkedWorktree ? "arrow.triangle.branch" : "shippingbox"
     }
+
+    /// Keyed on `repoKey` rather than the group id so every worktree of one repo
+    /// shares a color — the branch pill is what distinguishes them.
+    private var hue: Color { workbenchGroupColor(group.repoKey, isDark: theme.isDark) }
+}
+
+/// A muted, stable per-repo color so a long list of groups can be scanned by
+/// eye. Swift's `hashValue` is seeded per process and would hand a repo a
+/// different color on every launch, so this hashes explicitly (FNV-1a).
+/// Saturation and brightness are pinned per appearance — a free-floating hue at
+/// full saturation reads as a rainbow and loses contrast at both extremes.
+private func workbenchGroupColor(_ key: String, isDark: Bool) -> Color {
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    for byte in key.utf8 {
+        hash = (hash ^ UInt64(byte)) &* 0x0000_0100_0000_01b3
+    }
+    return Color(
+        hue: Double(hash % 360) / 360,
+        saturation: isDark ? 0.42 : 0.55,
+        brightness: isDark ? 0.86 : 0.62)
 }
 
 private struct WorkbenchSessionRow: View {
+    @Environment(\.workbenchTheme) private var theme
     let session: WorkbenchSessionRecord
     var worktreePath: String = ""
     var isSelected: Bool = false
+    var density: WorkbenchDensity = .comfortable
     var onPin: () -> Void = {}
     var onArchive: () -> Void = {}
     @State private var hovering = false
@@ -448,7 +617,7 @@ private struct WorkbenchSessionRow: View {
                         if let relative = relativeTime {
                             Text(relative)
                                 .font(.caption2)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(theme.secondary)
                                 .monospacedDigit()
                                 .opacity(hovering ? 0 : 1)
                         }
@@ -466,29 +635,32 @@ private struct WorkbenchSessionRow: View {
                                 .help(session.isArchived ? "Unarchive" : "Archive")
                             }
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(theme.secondary)
                         }
                     }
                     .frame(minWidth: 40, alignment: .trailing)
                 }
                 // Only when it says something the group header doesn't already.
-                if let subtitle {
+                if density.showsSubtitle, let subtitle {
                     Text(subtitle)
                         .font(.system(size: 10.5))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(theme.tertiary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
             }
         }
-        .padding(.vertical, 5)
+        .padding(.vertical, density.rowPadding)
         .padding(.leading, 8)
         .padding(.trailing, 6)
         .background(
             RoundedRectangle(cornerRadius: 6)
                 .fill(isSelected
-                      ? Color.accentColor.opacity(0.16)
-                      : (hovering ? Color.primary.opacity(0.055) : Color.clear))
+                      ? theme.selectionFill
+                      : (hovering ? theme.hoverFill : Color.clear))
+                // Only on selection: hover should stay instant, and a spring keyed
+                // on the whole row would replay on every refresh tick.
+                .animation(.spring(response: 0.25, dampingFraction: 0.8), value: isSelected)
         )
         // A leading accent bar makes the selected row readable at a glance even
         // against the terminal's own background tint.
@@ -498,6 +670,8 @@ private struct WorkbenchSessionRow: View {
                 .frame(width: 2.5)
                 .padding(.vertical, 3)
                 .opacity(isSelected ? 1 : 0)
+                .scaleEffect(y: isSelected ? 1 : 0.4, anchor: .center)
+                .animation(.spring(response: 0.25, dampingFraction: 0.8), value: isSelected)
         }
         .contentShape(Rectangle())
         .onHover { hovering = $0 }

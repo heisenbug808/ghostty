@@ -38,8 +38,14 @@ final class WorkbenchViewModel: ObservableObject {
         didSet {
             guard oldValue != searchText else { return }
             rebuildGroups()
+            scheduleContentSearch()
         }
     }
+    /// Sessions whose transcript contains the search text but whose title doesn't,
+    /// so searching can find a session by what was discussed in it.
+    @Published private(set) var contentHits: [WorkbenchTranscriptHit] = []
+    @Published private(set) var isSearchingContent = false
+    @Published private(set) var isGeneratingTitles = false
     @Published var statusMessage: String?
     /// Collapsed worktree groups, keyed by `WorkbenchWorktreeGroup.id`. Persisted
     /// so collapse state survives refreshes and relaunches.
@@ -69,6 +75,9 @@ final class WorkbenchViewModel: ObservableObject {
     private let collapseStore: WorkbenchGroupCollapseStore
     private let agentEvents: WorkbenchAgentEventService
     private let transcriptService = WorkbenchTranscriptService()
+    private let transcriptSearch = WorkbenchTranscriptSearchService()
+    private let titleGenerator = WorkbenchTitleGeneratorService()
+    private var contentSearchTask: Task<Void, Never>?
     private var fileWatcher: WorkbenchFileWatcher?
     private var isRefreshing = false
     private var refreshQueued = false
@@ -108,6 +117,11 @@ final class WorkbenchViewModel: ObservableObject {
         // constructing the model must have zero filesystem side effects.
         guard WorkbenchFeature.isEnabled else { return }
         agentEvents.ensureDirectoryExists()
+        // Closing a tab must free the session, or reopening it is refused as
+        // locked until the staleness grace expires.
+        WorkbenchSurfaceRegistry.shared.onWindowClosed = { [weak self] sessionId in
+            Task { @MainActor in await self?.releaseClosedSession(sessionId) }
+        }
         Task { await refresh() }
         startFileWatcher()
     }
@@ -334,6 +348,7 @@ final class WorkbenchViewModel: ObservableObject {
             let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
             $0.localTitle = trimmed.isEmpty ? nil : trimmed
         }
+        applyTabTitle(forSessionId: session.id)
     }
 
     private func mutate(_ session: WorkbenchSessionRecord, _ block: (inout WorkbenchSessionRecord) -> Void) {
@@ -426,6 +441,199 @@ final class WorkbenchViewModel: ObservableObject {
                 title: session?.displayTitle ?? String(event.sessionId.prefix(12)),
                 state: state,
                 cwd: session?.cwd ?? event.cwd)
+        }
+    }
+
+    /// The name the user gave this session, if any. Only an explicit rename is
+    /// pushed to the tab — Claude's own titles already reach the terminal title on
+    /// their own, and derived labels are list decoration, not a window name.
+    func tabTitle(forSessionId sessionId: String) -> String? {
+        guard let title = sessions.first(where: { $0.id == sessionId })?.localTitle,
+              !title.isEmpty else { return nil }
+        return title
+    }
+
+    /// Applies the Workbench name to the tab showing this session, so a rename is
+    /// reflected where the session actually is and not only in the list.
+    func applyTabTitle(forSessionId sessionId: String) {
+        guard let window = WorkbenchSurfaceRegistry.shared.window(for: sessionId),
+              let controller = TerminalController.all.first(where: { $0.window === window })
+        else { return }
+        // nil restores the terminal's own title when a rename is cleared.
+        controller.titleOverride = tabTitle(forSessionId: sessionId)
+    }
+
+    /// Frees a session whose Workbench window just closed, so it can be reopened
+    /// immediately instead of waiting out the lock's staleness grace.
+    private func releaseClosedSession(_ sessionId: String) async {
+        try? await WorkbenchLockService(store: store).release(sessionId: sessionId)
+        if let index = sessions.firstIndex(where: { $0.id == sessionId }),
+           sessions[index].status == .launching {
+            sessions[index].status = .idle
+        }
+        await refresh()
+    }
+
+    /// Sessions in the order they're actually on screen — collapsed groups
+    /// excluded — which is the order arrow keys have to move through.
+    var visibleSessions: [WorkbenchSessionRecord] {
+        worktreeGroups.flatMap { isGroupCollapsed($0.id) ? [] : $0.sessions }
+    }
+
+    /// Moves the selection by `offset` rows, starting at the top when nothing is
+    /// selected yet. Returns the newly selected session so the caller can act on it.
+    @discardableResult
+    func moveSelection(by offset: Int) -> WorkbenchSessionRecord? {
+        let visible = visibleSessions
+        guard !visible.isEmpty else { return nil }
+
+        let current = selectedSessionID.flatMap { id in visible.firstIndex { $0.id == id } }
+        // Arrowing down from nothing lands on the first row, up on the last.
+        let next: Int
+        if let current {
+            next = min(max(current + offset, 0), visible.count - 1)
+        } else {
+            next = offset > 0 ? 0 : visible.count - 1
+        }
+
+        let session = visible[next]
+        selectedSessionID = session.id
+        return session
+    }
+
+    /// True when a session's process is alive but Workbench doesn't own a window
+    /// for it — started from Claude Desktop, another terminal, or a background
+    /// agent. Resuming those would put a second process on one transcript, so the
+    /// UI offers Fork or End instead.
+    func isRunningElsewhere(_ session: WorkbenchSessionRecord) -> Bool {
+        session.status == .running && !WorkbenchSurfaceRegistry.shared.hasWindow(sessionId: session.id)
+    }
+
+    // MARK: - Generated titles
+
+    /// Sessions with no title of their own, which are the ones worth naming. A
+    /// session Claude Code titled, one the user renamed, or one already generated
+    /// is left alone.
+    var sessionsNeedingTitles: [WorkbenchSessionRecord] {
+        sessions.filter { session in
+            session.transcriptPath != nil
+                && (session.title?.isEmpty ?? true)
+                && (session.generatedTitle?.isEmpty ?? true)
+                && (session.localTitle?.isEmpty ?? true)
+                && !session.isArchived
+        }
+    }
+
+    /// Names untitled sessions by asking Claude to read each transcript's opening.
+    ///
+    /// Runs a couple at a time: each is a CLI invocation taking seconds, and
+    /// spawning dozens at once would swamp the machine for no gain. Progress is
+    /// reported as it goes and each title is persisted as it arrives, so stopping
+    /// part-way keeps what was already generated.
+    func generateMissingTitles() async {
+        let candidates = sessionsNeedingTitles
+        guard !candidates.isEmpty else {
+            statusMessage = "Every session already has a title"
+            return
+        }
+
+        isGeneratingTitles = true
+        defer { isGeneratingTitles = false }
+
+        let generator = titleGenerator
+        var completed = 0
+        var failed = 0
+
+        await withTaskGroup(of: (String, String?).self) { group in
+            var index = 0
+            let concurrency = 2
+
+            func addNext() {
+                guard index < candidates.count else { return }
+                let session = candidates[index]
+                index += 1
+                guard let path = session.transcriptPath else { return }
+                group.addTask {
+                    (session.id, try? await generator.title(forTranscriptAt: path))
+                }
+            }
+
+            for _ in 0..<min(concurrency, candidates.count) { addNext() }
+
+            while let (sessionId, title) = await group.next() {
+                if Task.isCancelled { group.cancelAll(); break }
+                completed += 1
+                if let title, !title.isEmpty {
+                    setGeneratedTitle(title, for: sessionId)
+                } else {
+                    failed += 1
+                }
+                statusMessage = "Naming sessions… \(completed)/\(candidates.count)"
+                addNext()
+            }
+        }
+
+        statusMessage = failed == 0
+            ? "Named \(completed) session(s)"
+            : "Named \(completed - failed) of \(completed); \(failed) failed"
+    }
+
+    private func setGeneratedTitle(_ title: String, for sessionId: String) {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        var updated = sessions[index]
+        updated.generatedTitle = title
+        updated.updatedAt = Date()
+        sessions[index] = updated
+        rebuildGroups()
+        Task { try? await store.updateSession(updated) }
+    }
+
+    // MARK: - Content search
+
+    /// Debounces content search behind the title filter, which is instant. Typing
+    /// keeps cancelling and rescheduling, so only a settled query scans the corpus.
+    private func scheduleContentSearch() {
+        contentSearchTask?.cancel()
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard query.count >= 2 else {
+            contentHits = []
+            isSearchingContent = false
+            return
+        }
+
+        let targets = sessions.compactMap { session -> WorkbenchTranscriptSearchService.Target? in
+            guard let path = session.transcriptPath else { return nil }
+            return .init(
+                sessionId: session.id,
+                path: path,
+                modifiedAt: session.lastModifiedAt ?? .distantPast)
+        }
+        let service = transcriptSearch
+
+        isSearchingContent = true
+        contentSearchTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard !Task.isCancelled else { return }
+            let hits = (try? await service.search(query: query, in: targets)) ?? []
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self, self.searchText.trimmingCharacters(in: .whitespacesAndNewlines) == query
+                else { return }
+                self.contentHits = hits
+                self.isSearchingContent = false
+            }
+        }
+    }
+
+    /// Content hits for sessions the title filter didn't already surface, so the
+    /// two result lists don't repeat each other.
+    var contentOnlyHits: [(hit: WorkbenchTranscriptHit, session: WorkbenchSessionRecord)] {
+        let shown = Set(worktreeGroups.flatMap { $0.sessions.map(\.id) })
+        return contentHits.compactMap { hit in
+            guard !shown.contains(hit.sessionId),
+                  let session = sessions.first(where: { $0.id == hit.sessionId })
+            else { return nil }
+            return (hit, session)
         }
     }
 

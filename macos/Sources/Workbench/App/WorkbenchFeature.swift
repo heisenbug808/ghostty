@@ -9,6 +9,7 @@ enum WorkbenchFeature {
     static let sidebarVisibleKey = "Workbench.SidebarVisible"
     static let sidebarWidthKey = "Workbench.SidebarWidth"
     static let detailsVisibleKey = "Workbench.DetailsVisible"
+    static let densityKey = "Workbench.Density"
 
     static var isEnabled: Bool {
         UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
@@ -24,6 +25,15 @@ enum WorkbenchFeature {
     static var isDetailsVisible: Bool {
         get { UserDefaults.standard.object(forKey: detailsVisibleKey) as? Bool ?? false }
         set { UserDefaults.standard.set(newValue, forKey: detailsVisibleKey) }
+    }
+
+    /// Session-row density. Comfortable (with subtitles) by default.
+    static var density: WorkbenchDensity {
+        get {
+            (UserDefaults.standard.string(forKey: densityKey)).flatMap(WorkbenchDensity.init(rawValue:))
+                ?? .comfortable
+        }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: densityKey) }
     }
 
     static var sidebarWidth: Double {

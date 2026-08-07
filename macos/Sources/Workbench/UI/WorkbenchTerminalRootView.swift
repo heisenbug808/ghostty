@@ -6,6 +6,7 @@ import GhosttyKit
 struct WorkbenchTerminalRootView<TerminalContent: View>: View {
     @ObservedObject var model: WorkbenchViewModel
     let ghostty: Ghostty.App
+    @ObservedObject private var ghosttyConfig: Ghostty.Config
     let parentWindowProvider: () -> NSWindow?
     let terminalContent: TerminalContent
     @State private var duplicateRunningSession: WorkbenchSessionRecord?
@@ -28,9 +29,14 @@ struct WorkbenchTerminalRootView<TerminalContent: View>: View {
     ) {
         self.model = model
         self.ghostty = ghostty
+        self.ghosttyConfig = ghostty.config
         self.parentWindowProvider = parentWindowProvider
         self.terminalContent = terminalContent()
     }
+
+    /// Chrome colors follow the terminal's own theme. `ghosttyConfig` is observed
+    /// so a live config reload (or theme switch) repaints the sidebar with it.
+    private var theme: WorkbenchTheme { WorkbenchTheme(config: ghosttyConfig) }
 
     var body: some View {
         Group {
@@ -74,12 +80,17 @@ struct WorkbenchTerminalRootView<TerminalContent: View>: View {
                                         icon: "sidebar.right",
                                         title: "No session selected",
                                         message: "Click a session to see its details, transcript, and git state.")
-                                    .background(Color(nsColor: .controlBackgroundColor))
+                                    .background(WorkbenchChromeBackground())
                                 }
                             }
                             .frame(width: detailsWidth)
+                            // Slide in from the edge it lives on rather than
+                            // appearing instantly and shoving the terminal aside.
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
                         }
                     }
+                    .animation(.spring(response: 0.28, dampingFraction: 0.85),
+                               value: model.isDetailsVisible)
                 } else {
                     // Sidebar hidden: keep an always-available affordance to reveal it
                     // again, since hiding it removes the in-sidebar toggle button and we
@@ -101,6 +112,7 @@ struct WorkbenchTerminalRootView<TerminalContent: View>: View {
                 terminalContent
             }
         }
+        .environment(\.workbenchTheme, theme)
         .alert(
             "Session Already Running",
             isPresented: duplicateRunningAlertBinding,
@@ -184,6 +196,12 @@ struct WorkbenchTerminalRootView<TerminalContent: View>: View {
             let controller = TerminalController.newTab(ghostty, from: parentWindowProvider(), withBaseConfig: config)
             if let sessionId = built.sessionId {
                 surfaceRegistry.register(sessionId: sessionId, launchId: built.launchId, window: controller?.window)
+                // Carry the user's own name onto the tab; without this the tab
+                // shows whatever the terminal reports and a rename appears to do
+                // nothing outside the sidebar.
+                if let title = model.tabTitle(forSessionId: sessionId) {
+                    controller?.titleOverride = title
+                }
             }
         }
     }

@@ -40,6 +40,9 @@ enum WorkbenchSessionLauncher {
         if let sessionId = built.sessionId {
             WorkbenchSurfaceRegistry.shared.register(
                 sessionId: sessionId, launchId: built.launchId, window: controller?.window)
+            if let title = WorkbenchViewModel.shared.tabTitle(forSessionId: sessionId) {
+                controller?.titleOverride = title
+            }
         }
     }
 }

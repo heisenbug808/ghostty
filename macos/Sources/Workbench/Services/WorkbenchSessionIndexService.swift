@@ -14,10 +14,23 @@ protocol WorkbenchSessionIndexing: AnyObject {
 final class FilesystemClaudeSessionIndexService: WorkbenchSessionIndexing {
     private let fileManager: FileManager
     private let configDirectory: URL
-    // Cache scraped metadata by path, keyed on mtime, so a re-index (e.g. from the
-    // auto-refresh file watcher firing while a transcript is being written) only
-    // re-reads the handful of files that actually changed.
-    private var scrapeCache: [String: (mtime: Date, meta: ScrapedMetadata)] = [:]
+    /// Scrape state per transcript, so re-indexing only reads what's new.
+    ///
+    /// The active session's transcript is both the largest file here (tens of MB)
+    /// and the one that changes constantly, so the file watcher re-indexes it every
+    /// time Claude writes a line. Re-reading it whole each time is the difference
+    /// between reading a few hundred bytes and rereading 60 MB once a second.
+    /// `offset` is the end of the last *complete* line consumed; everything before
+    /// it is already folded into `meta`.
+    private struct ScrapeState {
+        var size: Int
+        var mtime: Date
+        var offset: UInt64
+        var accumulator: Accumulator
+        var meta: ScrapedMetadata
+    }
+
+    private var scrapeCache: [String: ScrapeState] = [:]
 
     init(fileManager: FileManager = .default, configDirectory: URL? = nil) {
         self.fileManager = fileManager
@@ -58,6 +71,9 @@ final class FilesystemClaudeSessionIndexService: WorkbenchSessionIndexing {
             let projectName = url.deletingLastPathComponent().lastPathComponent
             let projectId = projectName.isEmpty ? "unknown" : projectName
             let meta = scrapeMetadata(at: url, mtime: values?.contentModificationDate)
+            // Sessions Workbench itself created to name other sessions aren't
+            // work the user did, so they never belong in the list.
+            if meta.cwd == WorkbenchTitleGeneratorService.scratchDirectory.path { continue }
             sessions.append(WorkbenchSessionRecord(
                 id: id,
                 projectId: projectId,
@@ -68,6 +84,7 @@ final class FilesystemClaudeSessionIndexService: WorkbenchSessionIndexing {
                 transcriptPath: url.standardizedFileURL.path,
                 messageCount: meta.messageCount,
                 lastMessageWasAssistant: meta.lastWasAssistant,
+                derivedLabel: meta.derivedLabel,
                 status: .indexed
             ))
         }
@@ -82,61 +99,144 @@ final class FilesystemClaudeSessionIndexService: WorkbenchSessionIndexing {
         /// True when the last conversational line was from the assistant (Claude
         /// replied and is waiting on the user) — drives the "needs review" filter.
         var lastWasAssistant: Bool?
+        /// Label derived from the opening prompt, kept separate from a real title.
+        var derivedLabel: String?
     }
 
-    /// Cheap single-pass scrape: substring pre-filter first, JSON-decode only the
-    /// handful of lines that can carry the fields we want. `cwd` is stable per
-    /// session, so we stop probing for it once found; titles use last-wins.
-    private func scrapeMetadata(at url: URL, mtime: Date?) -> ScrapedMetadata {
-        let path = url.standardizedFileURL.path
-        if let mtime, let cached = scrapeCache[path], cached.mtime == mtime {
-            return cached.meta
-        }
-        guard
-            let data = try? Data(contentsOf: url),
-            let contents = String(data: data, encoding: .utf8)
-        else { return ScrapedMetadata() }
-
+    /// Raw fields folded out of the transcript, kept separate from the derived
+    /// `ScrapedMetadata` so a partial scan can be resumed and finished later.
+    /// Every field is incrementally computable: counters add, "last wins" fields
+    /// overwrite, and "first wins" fields only fill when still empty.
+    private struct Accumulator {
         var customTitle: String?
         var aiTitle: String?
         var lastPrompt: String?
+        /// The opening request, which describes what the session is *about* — the
+        /// last prompt is usually trailing housekeeping.
+        var firstPrompt: String?
         var cwd: String?
         var messages = 0
         var lastWasAssistant: Bool?
 
-        contents.enumerateLines { line, _ in
-            let interesting = line.contains("\"type\"")
-                || line.contains("custom-title")
-                || line.contains("ai-title")
-                || line.contains("last-prompt")
-                || (cwd == nil && line.contains("\"cwd\""))
-            guard
-                interesting,
-                let lineData = line.data(using: .utf8),
-                let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any]
-            else { return }
+        var metadata: ScrapedMetadata {
+            ScrapedMetadata(
+                // Only Claude Code's own title counts as a title. The label built
+                // from the opening request (falling back to the last prompt when a
+                // session never had a usable opening one) is reported separately so
+                // a generated title can outrank it.
+                title: customTitle ?? aiTitle,
+                summary: lastPrompt,
+                cwd: cwd,
+                messageCount: messages > 0 ? messages : nil,
+                lastWasAssistant: lastWasAssistant,
+                derivedLabel: WorkbenchSessionLabel.label(for: firstPrompt)
+                    ?? WorkbenchSessionLabel.label(for: lastPrompt))
+        }
+    }
 
-            switch object["type"] as? String {
-            case "user": messages += 1; lastWasAssistant = false
-            case "assistant": messages += 1; lastWasAssistant = true
-            case "custom-title": customTitle = (object["customTitle"] as? String) ?? customTitle
-            case "ai-title": aiTitle = (object["aiTitle"] as? String) ?? (object["title"] as? String) ?? aiTitle
-            case "last-prompt": lastPrompt = (object["lastPrompt"] as? String) ?? lastPrompt
-            default: break
-            }
-            if cwd == nil, let value = object["cwd"] as? String, !value.isEmpty {
-                cwd = value
-            }
+    /// Streams the transcript, folding each line into an accumulator.
+    ///
+    /// Reads only the bytes appended since the last scrape when the file has just
+    /// grown, which is the normal case for the session being written to right now.
+    /// A file that shrank was rewritten rather than appended to, so it's rescanned
+    /// from the start. Lines are decoded from a chunk buffer rather than loading
+    /// the file, keeping peak memory flat no matter how large a transcript gets.
+    private func scrapeMetadata(at url: URL, mtime: Date?) -> ScrapedMetadata {
+        let path = url.standardizedFileURL.path
+        let attributes = try? fileManager.attributesOfItem(atPath: path)
+        let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+        let cached = scrapeCache[path]
+
+        // Untouched since the last scrape: nothing to do.
+        if let cached, let mtime, cached.mtime == mtime, cached.size == size {
+            return cached.meta
         }
 
-        let meta = ScrapedMetadata(
-            title: customTitle ?? aiTitle,
-            summary: lastPrompt,
-            cwd: cwd,
-            messageCount: messages > 0 ? messages : nil,
-            lastWasAssistant: lastWasAssistant
-        )
-        if let mtime { scrapeCache[path] = (mtime, meta) }
+        let resumable = cached.map { size >= $0.size } ?? false
+        var accumulator = resumable ? (cached?.accumulator ?? Accumulator()) : Accumulator()
+        var offset: UInt64 = resumable ? (cached?.offset ?? 0) : 0
+
+        guard let handle = FileHandle(forReadingAtPath: path) else { return ScrapedMetadata() }
+        defer { try? handle.close() }
+        if offset > 0 { try? handle.seek(toOffset: offset) }
+
+        var pending = Data()
+        let newline = UInt8(ascii: "\n")
+        while true {
+            guard let chunk = try? handle.read(upToCount: 1 << 18), !chunk.isEmpty else { break }
+            pending.append(chunk)
+            while let end = pending.firstIndex(of: newline) {
+                let lineData = pending[pending.startIndex..<end]
+                let consumed = pending.distance(from: pending.startIndex, to: end) + 1
+                pending.removeSubrange(pending.startIndex...end)
+                offset += UInt64(consumed)
+                if let line = String(data: lineData, encoding: .utf8) {
+                    fold(line: line, into: &accumulator)
+                }
+            }
+        }
+        // A trailing line with no newline is either the last line of a file that
+        // simply doesn't end in one — which must still count — or a line caught
+        // mid-write, whose truncated JSON folds to nothing. Either way it's folded
+        // into the *returned* result but not into the cached state, and `offset`
+        // stops short of it: when the newline arrives the line is read again and
+        // folded exactly once.
+        var result = accumulator
+        if !pending.isEmpty, let line = String(data: pending, encoding: .utf8) {
+            fold(line: line, into: &result)
+        }
+
+        let meta = result.metadata
+        if let mtime {
+            scrapeCache[path] = ScrapeState(
+                size: size, mtime: mtime, offset: offset, accumulator: accumulator, meta: meta)
+        }
         return meta
+    }
+
+    /// Substring pre-filter first, JSON-decode only the handful of lines that can
+    /// carry the fields we want.
+    private func fold(line: String, into accumulator: inout Accumulator) {
+        let interesting = line.contains("\"type\"")
+            || line.contains("custom-title")
+            || line.contains("ai-title")
+            || line.contains("last-prompt")
+            || (accumulator.cwd == nil && line.contains("\"cwd\""))
+        guard
+            interesting,
+            let lineData = line.data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any]
+        else { return }
+
+        switch object["type"] as? String {
+        case "user":
+            accumulator.messages += 1
+            accumulator.lastWasAssistant = false
+            // Keep the first prompt the user actually wrote: skip subagent
+            // transcripts, injected meta turns, and harness scaffolding.
+            if accumulator.firstPrompt == nil,
+               object["isSidechain"] as? Bool != true,
+               object["isMeta"] as? Bool != true,
+               let message = object["message"] as? [String: Any],
+               let text = message["content"] as? String,
+               !WorkbenchSessionLabel.isScaffolding(text) {
+                accumulator.firstPrompt = text
+            }
+        case "assistant":
+            accumulator.messages += 1
+            accumulator.lastWasAssistant = true
+        case "custom-title":
+            accumulator.customTitle = (object["customTitle"] as? String) ?? accumulator.customTitle
+        case "ai-title":
+            accumulator.aiTitle = (object["aiTitle"] as? String)
+                ?? (object["title"] as? String) ?? accumulator.aiTitle
+        case "last-prompt":
+            accumulator.lastPrompt = (object["lastPrompt"] as? String) ?? accumulator.lastPrompt
+        default:
+            break
+        }
+        if accumulator.cwd == nil, let value = object["cwd"] as? String, !value.isEmpty {
+            accumulator.cwd = value
+        }
     }
 }
